@@ -297,8 +297,10 @@ class Submitter:
         if not model_source.exists():
             raise FileNotFoundError(f"model source not found: {model_source}")
 
+        # Only a real submission needs the engine object present. A dry run on
+        # a laptop targeting `param` legitimately cannot have one.
         engine = repo / "physics" / "build" / self.host.name / "necessary_functions.o"
-        if not engine.exists():
+        if not self.dry_run and not engine.exists():
             raise FileNotFoundError(
                 f"engine object missing: {engine}\n"
                 f"run `make -C {repo/'physics'} HOST={self.host.name}` first")
