@@ -9,6 +9,107 @@ Sweep rules, following Superconductivity's generators:
     scalar        -> fixed
     list          -> swept
     "?"           -> wildcard, for the dedup query only
+
+HPC resource parameters
+=======================
+partition, qos, nodes, npn, cpt, max_concurrent_jobs, slurm_user
+
+None of these are set in this file. They describe the machine, not the sweep,
+so they live in exactly one place -- the HostConfig profiles in
+workflow/hpc_config.py -- and reach a job like this:
+
+    hpc_config.LOCAL/PARAM/HPC  ->  Submitter.__init__  ->  job_script()
+                                    (copies all seven)      (writes #SBATCH)
+
+Which profile is used is decided by hpc_config.detect_host(), which looks at
+$HOME, or forced with  --host local|param|hpc .
+
+What each one controls
+----------------------
+partition   #SBATCH --partition -- the SLURM queue. Used twice: it names the
+            queue the job goes to, and it is the queue wait_for_slot() counts
+            against. If it does not name the queue the jobs actually land in,
+            the throttle is counting the wrong jobs.
+
+qos         #SBATCH --qos -- the quality-of-service class.
+
+nodes       #SBATCH --nodes -- compute nodes per job.
+
+npn         #SBATCH --ntasks-per-node -- MPI ranks per node.
+            Total ranks = nodes * npn. ChargeCurrent() splits the k-grid
+            across them, so this is the coarse-grained parallelism.
+
+cpt         #SBATCH --cpus-per-task -- cores per rank. job.sh exports it as
+            OMP_NUM_THREADS, so it is the OpenMP thread count inside a rank.
+
+max_concurrent_jobs
+            Not a SLURM directive. wait_for_slot() blocks while
+            `squeue -u <slurm_user> -p <partition>` already shows this many
+            jobs, so a long sweep trickles in instead of flooding the queue.
+
+slurm_user  The account passed to `squeue -u`, by both wait_for_slot() and
+            preparing_run()'s live-job cross-check. A wrong value is silent
+            and harmful: squeue returns nothing, so the throttle never
+            engages and preparing_run() cannot tell a still-running job from
+            a dead one.
+
+The one arithmetic rule
+-----------------------
+npn * cpt must equal the cores per node you are entitled to, because job.sh
+maps ranks onto cores with
+
+    mpirun --map-by ppr:${SLURM_NTASKS_PER_NODE}:node:PE=${SLURM_CPUS_PER_TASK}
+
+Go over and ranks share cores; go under and cores sit idle. The shipped
+profiles, all of which satisfy it:
+
+    host    nodes  npn  cpt   ranks  npn*cpt   note
+    local     1     2    2      2       4      laptop; dry runs and smoke tests
+    param     5     2   24     10      48      PARAM Ananta, 48 cores/node
+    hpc       2     8    4     16      32      IITGN HPC2, under the 80-core cap
+
+How to change them
+------------------
+1. Permanently, for every sweep on that machine -- the usual case.
+   Edit the profile in workflow/hpc_config.py:
+
+       PARAM = HostConfig(
+           name="param",
+           modules=("gcc", "openmpi"),
+           nodes=5, npn=2, cpt=24,        # <-- edit here
+           max_concurrent_jobs=25,
+       )
+
+   Anything a profile does not name falls back to the HostConfig defaults
+   (partition="medium", qos="normal", slurm_user="debamalya.dutta"). So to
+   change partition, qos or slurm_user for one machine, add it explicitly to
+   that profile -- editing the dataclass default changes all three hosts.
+
+2. For one sweep only, without touching the shared profile.
+   Assign to the Submitter in main(), directly after constructing it and
+   BEFORE acquire_lock()/preparing_run() -- preparing_run() already reads
+   slurm_user, and every job.sh written later reads the rest:
+
+       s = Submitter("four_band", host=args.host, ...)
+       s.job_name = args.name         # the same pattern, already in main()
+       s.nodes = 10                   # big grid: twice the usual nodes
+       s.max_concurrent_jobs = 4      # be polite while the cluster is busy
+
+   Only these seven are copied onto the Submitter. modules, env_exports,
+   mpirun_flags and extra_sbatch are read from s.host directly and can only
+   be changed in hpc_config.py.
+
+Check before submitting
+-----------------------
+Print the directives a profile produces without queueing anything (run from
+workflow/, or with workflow/ on sys.path):
+
+    >>> from submit_utils import Submitter
+    >>> print(Submitter("four_band", host="param").job_script())
+
+--dry-run is the other half of the check: it builds dir_NNNNN and rewrites
+the model source, then stops before compiling or submitting. It does not
+write job.sh, so use job_script() above to inspect the #SBATCH block.
 """
 
 import argparse
