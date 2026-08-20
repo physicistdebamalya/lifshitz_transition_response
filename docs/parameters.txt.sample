@@ -1,0 +1,22 @@
+calculations started for...
+**********************************************************************************************************************************
+alpha = 1
+beta = 0.5
+delta = 0.5
+m = 0.1
+N1 = 31
+N2 = 31
+A0X = 0.5
+ETPX = 100
+delayX = 0
+pulse_typeX = sin^2 with envelope
+nuX = 0.3
+number_of_cycleX = 10
+A0Y = 0.5
+ETPY = 100
+delayY = 0
+pulse_typeY = sin^2 with envelope
+nuY = 0.3
+number_of_cycleY = 10
+initial time = 0
+final time = 66.6667

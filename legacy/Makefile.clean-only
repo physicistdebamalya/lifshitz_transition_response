@@ -1,0 +1,24 @@
+.PHONY: all clean clear delete
+
+all:
+	@echo "Nothing to do."
+
+# List of directories/files to remove
+CLEAN_ITEMS := *.csv exe_test run_std*
+
+clean:
+	@echo "Removing generated files and directories..."
+	@for item in $(CLEAN_ITEMS); do \
+        if [ -e $$item ]; then \
+            echo "  rm -r $$item"; \
+            rm -r $$item; \
+        else \
+            echo "  skipping $$item (not found)"; \
+        fi \
+    done
+
+clear: clean
+	@echo "Clear complete."
+
+delete: clean
+	@echo "Delete complete."
