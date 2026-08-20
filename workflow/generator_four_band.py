@@ -186,6 +186,14 @@ def main():
                   dry_run=args.dry_run)
     s.job_name = args.name
 
+    # Per-sweep overrides -- uncomment to override the host profile for this
+    # sweep only (see the module docstring). Keep npn * cpt equal to the
+    # node's core count: param 48 (e.g. 4 x 12), hpc 32 (e.g. 4 x 8).
+    # s.nodes = 8                 # param only -- hpc's 80-core cap allows 2
+    # s.npn = 4                   # MPI ranks per node
+    # s.cpt = 12                  # OMP threads per rank; param 4 * 12 = 48
+    # s.max_concurrent_jobs = 10  # how many jobs may sit in the queue at once
+
     points = list(sweep())
     print(f"host={s.host.name}  model=four_band  points={len(points)}", flush=True)
 
