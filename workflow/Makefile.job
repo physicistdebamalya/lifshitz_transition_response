@@ -1,0 +1,60 @@
+# workflow/Makefile.job -- copied into each dir_NNNNN as `Makefile`.
+#
+# Compiles only the rewritten model source sitting next to it and links the
+# engine object that `make -C physics` already built. The engine is a heavy
+# Eigen + odeint translation unit; rebuilding it per job would dominate
+# submission time, so it is compiled once per host and reused.
+#
+#   make MODEL=four_band HOST=param REPO=/path/to/new
+#
+# REPO/HOST are passed by workflow/submit_utils.py; MODEL names the .cpp that
+# change_lines() wrote into this directory.
+
+MODEL ?= $(error MODEL not set)
+HOST  ?= local
+REPO  ?= $(error REPO not set)
+
+PHYSICS := $(REPO)/physics
+ENGINE  := $(PHYSICS)/build/$(HOST)/necessary_functions.o
+
+MPI_LOCAL := $(HOME)/cpp_libraries/openmpi-5.0.8/build/bin
+CXX  := mpic++
+STD  := -std=c++17
+WARN := -Wall -Wextra -Wno-unknown-pragmas
+COMMON := -O3 -DNDEBUG -fopenmp $(STD) $(WARN)
+
+ifeq ($(HOST),local)
+  LIBROOT := $(HOME)/cpp_libraries
+  ARCH    := -march=native -mtune=native
+  LDEXTRA :=
+  CXX     := $(MPI_LOCAL)/mpic++
+else ifeq ($(HOST),param)
+  LIBROOT := /home/debamalya.dutta/cpp_libraries
+  ARCH    := -march=cascadelake -mtune=cascadelake -mprefer-vector-width=512 \
+             -mavx512f -mavx512dq -mavx512bw -mavx512vl
+  LDEXTRA :=
+else ifeq ($(HOST),hpc)
+  LIBROOT   := /iitgn/homedirs/debamalya.dutta/cpp_libraries
+  ARCH      := -mtune=generic
+  CUDA_STUB := /iitgn/apps/packages/nvhpc/Linux_x86_64/25.3/cuda/12.8/targets/x86_64-linux/lib/stubs
+  LIBFABRIC := /iitgn/apps/spack/opt/spack/linux-rocky8-cascadelake/gcc-12.3.0/libfabric-1.22.0-kjorf5ozailt7w3dgotagzdhf5zgpcvd/lib
+  LDEXTRA   := -L$(CUDA_STUB) -L$(LIBFABRIC) -lcuda -lfabric
+else
+  $(error unknown HOST '$(HOST)')
+endif
+
+CXXFLAGS := $(COMMON) $(ARCH) -I$(PHYSICS)/include \
+            -I$(LIBROOT)/eigen-5.0.0 -I$(LIBROOT)/boost_1_89_0
+
+exe_run: $(MODEL).o $(ENGINE)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDEXTRA)
+
+$(MODEL).o: $(MODEL).cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(ENGINE):
+	$(error engine object missing: $(ENGINE) -- run `make -C $(PHYSICS) HOST=$(HOST)` first)
+
+.PHONY: clean
+clean:
+	rm -f *.o exe_run

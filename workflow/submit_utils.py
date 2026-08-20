@@ -130,9 +130,20 @@ class Submitter:
 
     # -------------------------------------------------------------- resume --
     def is_job_complete(self, run_dir):
-        for log in Path(run_dir).glob("mpi_logs_*.out"):
-            if COMPLETION_MARKER in log.read_text(errors="ignore"):
-                return True
+        """Both conditions, as AM3_submit_utils.is_job_complete requires: the
+        marker can be present in a log from an earlier attempt in a reused
+        directory, and data.csv can exist while the run was still writing."""
+        run_dir = Path(run_dir)
+        if not (run_dir / "data.csv").exists():
+            return False
+        for log in run_dir.glob("mpi_logs_*.out"):
+            try:
+                with open(log, errors="ignore") as f:
+                    for line in f:
+                        if COMPLETION_MARKER in line:
+                            return True
+            except OSError:
+                continue
         return False
 
     def preparing_run(self):
@@ -269,24 +280,87 @@ class Submitter:
         with open(self.cwd / DIRECTORIES_TXT, "a") as f:
             f.write(f"{self.iteration}. {run_dir.name}\n")
 
-    def submit(self, p, binary):
-        """Create a run dir, place the binary and job.sh in it, and sbatch."""
-        run_dir = self.new_run_dir()
-        self.iteration += 1
+    def submit(self, p, model_source=None, repo=None):
+        """Realise one parameter point: rewrite, compile, submit.
 
-        shutil.copy2(binary, run_dir / "exe_run")
-        (run_dir / "job.sh").write_text(self.job_script())
-        self.record_directory(run_dir)
+        Follows AM3_submit_utils.submit step for step:
+          dir_NNNNN -> change_lines into it -> Makefile -> compile
+                    -> job.sh -> sbatch -> directories.txt
+
+        A compile failure quarantines the directory and returns None rather
+        than aborting: one bad point in a 60-point sweep should not cost the
+        other 59.
+        """
+        repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
+        model_source = Path(model_source) if model_source else (
+            repo / "physics" / "models" / f"{self.model}.cpp")
+        if not model_source.exists():
+            raise FileNotFoundError(f"model source not found: {model_source}")
+
+        engine = repo / "physics" / "build" / self.host.name / "necessary_functions.o"
+        if not engine.exists():
+            raise FileNotFoundError(
+                f"engine object missing: {engine}\n"
+                f"run `make -C {repo/'physics'} HOST={self.host.name}` first")
+
+        run_dir = self.new_run_dir()
+        target = run_dir / f"{self.model}.cpp"
+
+        try:
+            change_lines(model_source, target, build_replacements(p, self.schema))
+        except ValueError:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+
+        shutil.copy2(repo / "workflow" / "Makefile.job", run_dir / "Makefile")
 
         if self.dry_run:
-            print(f"  [dry-run] prepared {run_dir.name}, not submitting", flush=True)
+            print(f"  [dry-run] prepared {run_dir.name} "
+                  f"({self.model}.cpp rewritten, not compiled)", flush=True)
             return run_dir
+
+        cmd = f"make MODEL={self.model} HOST={self.host.name} REPO={repo}"
+        if self.host.modules:
+            cmd = f"{self.host.module_block().replace(chr(10), ' && ')} && {cmd}"
+
+        try:
+            subprocess.run(cmd, shell=True, check=True, executable="/bin/bash",
+                           cwd=run_dir, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            self._quarantine(run_dir, f"compile failed", e.stderr)
+            return None
+
+        self.iteration += 1
+        (run_dir / "job.sh").write_text(self.job_script())
 
         try:
             subprocess.run(["sbatch", "job.sh"], cwd=run_dir, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"  ⚠️  sbatch failed for {run_dir.name}: {e}", flush=True)
+            self._quarantine(run_dir, f"sbatch failed: {e}", "")
+            self.iteration -= 1
+            return None
+
+        self.record_directory(run_dir)
         return run_dir
+
+    def _quarantine(self, run_dir, why, detail=""):
+        """Move a failed run dir aside so it can be inspected, without letting
+        it look like a pending job to preparing_run()."""
+        backup = self.cwd / BACKUP_DIRNAME
+        backup.mkdir(exist_ok=True)
+        target = backup / run_dir.name
+        if target.exists():
+            target = backup / f"{run_dir.name}_{int(time.time())}"
+        try:
+            shutil.move(str(run_dir), str(target))
+        except OSError:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            target = None
+        print(f"  ⚠️  {why} for {run_dir.name}"
+              + (f"; moved to {target}" if target else "; removed"), flush=True)
+        if detail:
+            tail = "\n".join(detail.strip().splitlines()[-8:])
+            print(f"      {tail}", flush=True)
 
     def wait_for_slot(self, poll=300):
         while count_running_jobs(self.slurm_user, self.partition) >= self.max_concurrent_jobs:

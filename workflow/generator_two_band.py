@@ -18,7 +18,7 @@ import numpy as np                                            # noqa: E402
 
 from data_utils import clean_path                             # noqa: E402
 from models import TWO_BAND                                   # noqa: E402
-from submit_utils import Submitter, build_replacements        # noqa: E402
+from submit_utils import Submitter        # noqa: E402
 
 ARCHIVE = clean_path("/home/debamalya/ComputationData/PostDoc/programming/new/data/two_band_model")
 
@@ -87,25 +87,27 @@ def main():
         s.acquire_lock()
         s.preparing_run()
 
-    submitted = skipped = 0
+    submitted = skipped = failed = 0
     for p in points:
         if s.already_exists(p):
-            print(f"  skip T={p['Temperature']:<5} ef={p['ef']:<5} "
-                  f"nu={p['nuX']:<6} — already in the archive", flush=True)
+            print(f"  skip T={p['Temperature']:<5} ef={p['ef']:<5} nu={p['nuX']:<6} — already in the archive", flush=True)
             skipped += 1
             continue
-        reps = build_replacements(p, TWO_BAND)
-        if args.dry_run:
-            print(f"  would submit T={p['Temperature']:<5} ef={p['ef']:<5} "
-                  f"nu={p['nuX']:<6} ({len(reps)} substitutions)", flush=True)
-            submitted += 1
-            continue
-        s.wait_for_slot()
-        raise SystemExit(
-            "Real submission needs the per-run compile step; use --dry-run "
-            "until the task.csv pass replaces source rewriting.")
 
-    print(f"\n{submitted} to submit, {skipped} already present.", flush=True)
+        if not args.dry_run:
+            s.wait_for_slot()
+
+        run_dir = s.submit(p)
+        if run_dir is None:
+            failed += 1
+            continue
+        submitted += 1
+        print(f"  {'prepared' if args.dry_run else 'submitted'} T={p['Temperature']:<5} ef={p['ef']:<5} nu={p['nuX']:<6} "
+              f"-> {run_dir.name}", flush=True)
+
+    verb = "prepared" if args.dry_run else "submitted"
+    print(f"\n{submitted} {verb}, {skipped} already present"
+          + (f", {failed} failed" if failed else "") + ".", flush=True)
 
 
 if __name__ == "__main__":
