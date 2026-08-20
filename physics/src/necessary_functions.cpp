@@ -1,7 +1,7 @@
 // necessary_functions.cpp
 
 #include <iomanip>
-#include "./necessary_functions.h"
+#include "necessary_functions.h"
 
 namespace Pauli
 {

@@ -1,7 +1,7 @@
 // main cpp file for tight binding Altermagnetic model
 
 #include <fstream>
-#include "./necessary_functions.h"
+#include "necessary_functions.h"
 #include "unsupported/Eigen/KroneckerProduct"
 
 // using namespace std;
