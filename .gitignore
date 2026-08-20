@@ -1,0 +1,48 @@
+# ---- build artifacts ----
+build/
+*.o
+*.d
+exe_*
+*.out
+*.err
+
+# ---- notebooks (tracked content lives in .py modules) ----
+*.ipynb
+.ipynb_checkpoints/
+
+# ---- data: never in git; archive lives under ~/ComputationData ----
+*.csv
+*.npz
+*.npy
+data.csv
+parameters.txt
+logfile*.txt
+directories.txt
+detailed_output.log
+tmp_log*
+mpi_logs_*
+
+# ---- run scratch produced by the submitter ----
+dir_[0-9][0-9][0-9][0-9][0-9]/
+incomplete_runs/
+.submit_lock
+job.sh
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- figures (regenerated from the archive) ----
+*.png
+*.pdf
+*.jpg
+
+# ---- editor / OS ----
+.vscode/
+.DS_Store
+*.swp
+
+# ---- mathematica ----
+*.nb.bak
