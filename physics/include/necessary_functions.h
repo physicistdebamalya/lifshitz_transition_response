@@ -165,17 +165,56 @@ public:
     }
 };
 
+// A single-slot memo in front of D2Pulse::A.
+//
+// Per accepted timestep, odeint's runge_kutta4 evaluates the system at t,
+// t + dt/2 (twice, k2 and k3 share one `th`) and t + dt, and integrate_times
+// calls the observer at t as well. That is five A(t) evaluations landing on
+// three distinct times, with the observer's t always repeating the step's
+// first stage. Remembering the most recent (t, A) pair collapses the five to
+// two. It is worth doing because each A(t) is two PulseType::PULSE calls --
+// a nested switch plus exp/sin -- run for every k-point of every timestep.
+//
+// Deliberately not shared. One cache is constructed per k-point on the stack
+// of the OpenMP worker that owns that k (see integrate_single_k), so the
+// mutable state is never reachable from a second thread.
+//
+// The lookup compares t bit-exactly, so a hit returns precisely the value
+// D2Pulse::A would have recomputed. No result changes.
+class PulseCache
+{
+private:
+    const D2Pulse &pulse;
+    mutable Eigen::Vector2d cached_A = Eigen::Vector2d::Zero();
+    mutable double cached_t = 0.0;
+    mutable bool valid = false;
+
+public:
+    explicit PulseCache(const D2Pulse &pulse_) : pulse(pulse_) {}
+
+    const Eigen::Vector2d &A(const double t) const
+    {
+        if (!valid || t != cached_t)
+        {
+            cached_A = pulse.A(t);
+            cached_t = t;
+            valid = true;
+        }
+        return cached_A;
+    }
+};
+
 template <typename matrixType, typename HFunc>
 class LMEEvolve
 {
 private:
     const HFunc &Ham;
-    const D2Pulse &pulse;
+    const PulseCache &pulse;
     const Eigen::Vector2d &k;
     const std::vector<typename matrixType::PlainObject, Eigen::aligned_allocator<typename matrixType::PlainObject>> &Ls;
 
 public:
-    LMEEvolve(const HFunc &H_, const D2Pulse &pulse_, const Eigen::Vector2d &k_, const std::vector<typename matrixType::PlainObject, Eigen::aligned_allocator<typename matrixType::PlainObject>> &Ls_)
+    LMEEvolve(const HFunc &H_, const PulseCache &pulse_, const Eigen::Vector2d &k_, const std::vector<typename matrixType::PlainObject, Eigen::aligned_allocator<typename matrixType::PlainObject>> &Ls_)
         : Ham(H_), pulse(pulse_), k(k_), Ls(Ls_) {}
 
     void operator()(const Eigen::MatrixBase<matrixType> &rho, typename matrixType::PlainObject &drhodt, const double t) const
@@ -198,14 +237,14 @@ class integration_observer
 private:
     std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> &J_thread;
     const voFunc &VO;
-    const D2Pulse &pulse;
+    const PulseCache &pulse;
     const Eigen::Vector2d &k;
     size_t time_index;
 
 public:
     integration_observer(std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> &J_thread_,
                          const voFunc &VO_,
-                         const D2Pulse &pulse_,
+                         const PulseCache &pulse_,
                          const Eigen::Vector2d &k)
         : J_thread(J_thread_), VO(VO_), pulse(pulse_), k(k), time_index(0) {}
 
@@ -249,8 +288,13 @@ void integrate_single_k(const Eigen::Vector2d &k,
     density_init(rho);
 
     // 2. Setup System
-    LMEEvolve<matrixType, HFunc> system(Ham, pulse, k, Ls);
-    integration_observer<matrixType, voFunc> obs(J_thread, VO, pulse, k);
+    // One cache, shared by the stepper and the observer, so the vector
+    // potential at a given t is computed once and reused by both. Stack-local
+    // to this k-point, hence private to the calling thread.
+    const PulseCache pulse_cache(pulse);
+
+    LMEEvolve<matrixType, HFunc> system(Ham, pulse_cache, k, Ls);
+    integration_observer<matrixType, voFunc> obs(J_thread, VO, pulse_cache, k);
 
     // 3. Time Step
     const double dt = (Time.size() >= 2) ? (Time[1] - Time[0]) : 1e-3;

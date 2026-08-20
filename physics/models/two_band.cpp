@@ -71,7 +71,7 @@ inline Eigen::Vector2d shifted_momentum(const Eigen::Vector2d &k, const Eigen::V
 // entirely from D_off_diag rather than re-derived independently.
 inline c_d off_diag(const Eigen::Vector2d &p)
 {
-    return alpha * pow(p[0], 2) - delta - constants::z * beta * p[1];
+    return alpha * (p[0] * p[0]) - delta - constants::z * beta * p[1];
 }
 
 inline Eigen::Vector2cd D_off_diag(const Eigen::Vector2d &p)
@@ -363,7 +363,8 @@ int main(int argc, char *argv[])
                 file << "Time,Ax,Ay,Jx,Jy\n";
                 for (size_t i = 0; i < Time.size(); ++i)
                 {
-                    file << Time[i] << "," << pulse.A(Time[i])[0] << "," << pulse.A(Time[i])[1] << "," << TC[i][0] << "," << TC[i][1] << "\n";
+                    const Eigen::Vector2d A_i = pulse.A(Time[i]);
+                    file << Time[i] << "," << A_i[0] << "," << A_i[1] << "," << TC[i][0] << "," << TC[i][1] << "\n";
                 }
             }
             file.close();

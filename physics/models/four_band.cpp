@@ -421,7 +421,8 @@ int main(int argc, char *argv[])
                 file << "Time,Ax,Ay,Jx,Jy\n";
                 for (size_t i = 0; i < Time.size(); ++i)
                 {
-                    file << Time[i] << "," << pulse.A(Time[i])[0] << "," << pulse.A(Time[i])[1] << "," << TC[i][0] << "," << TC[i][1] << "\n";
+                    const Eigen::Vector2d A_i = pulse.A(Time[i]);
+                    file << Time[i] << "," << A_i[0] << "," << A_i[1] << "," << TC[i][0] << "," << TC[i][1] << "\n";
                 }
             }
             file.close();

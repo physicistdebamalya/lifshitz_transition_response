@@ -39,6 +39,16 @@ venv/
 *.pdf
 *.jpg
 
+# ---- latex build artifacts (docs/*.tex is the source; the PDF is regenerable) ----
+*.aux
+*.toc
+*.lof
+*.lot
+*.log
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
 # ---- editor / OS ----
 .vscode/
 .DS_Store

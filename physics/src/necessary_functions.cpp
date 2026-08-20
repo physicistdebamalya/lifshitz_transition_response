@@ -119,7 +119,8 @@ double PulseType::gaussian(const double t) const
     double t2 = t - ti;
     if ((t2 >= 0) && (t2 <= ttotal))
     {
-        A = A0 * std::exp(-(1.0 / 2.0) * pow((t2 - mu) / sigma, 2));
+        const double u = (t2 - mu) / sigma;
+        A = A0 * std::exp(-(1.0 / 2.0) * (u * u));
     }
     else
     {
@@ -134,7 +135,8 @@ double PulseType::sin2(const double t) const
     double t2 = t - ti;
     if ((t2 >= 0) && (t2 <= ttotal))
     {
-        A = A0 * pow(std::sin((omega / (2 * number_of_cycle_of_pulse)) * t2), 2);
+        const double s = std::sin((omega / (2 * number_of_cycle_of_pulse)) * t2);
+        A = A0 * (s * s);
     }
     else
     {
