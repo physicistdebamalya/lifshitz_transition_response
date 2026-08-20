@@ -17,6 +17,8 @@ const std::string System = "Response of Lifshitz transition in a four-band model
 constexpr double Temperature = 0.02;
 constexpr double ef = 0.02;
 constexpr double dephase = 0.0; // dephasing rate
+constexpr double ETP = 100.0;         // extra time percentage: integrate past the pulse by this much
+constexpr int TIME_DIVISION = 1000;   // time steps per unit time; sets dt and the whole time grid
 
 constexpr int N1 = 31;
 constexpr int N2 = 31;
@@ -27,7 +29,6 @@ const PulseKind pulse_typeX = PulseKind::Sin2;        // Type of pulse
 const PulseKind pulse_wrapperX = PulseKind::Envelope; // "NA" if not and Envelope. "Envelope" if an Envelope of sin pulse
 constexpr double sigmaX = 0.1;                        // in case of gaussian pulse is the SD
 constexpr double ntt_sigmaX = 1.0;                    // in case of gaussian pulse, total time = ntt_sigma * sigma
-constexpr double ETPX = 100.0;                        // Extra time percentage
 constexpr double delayX = 0.0;                        // consider it as initial time t_i, i.e. from 0 how long it delayed to start
 constexpr int number_of_cycleX = 10;                  // number of cycles of the pulse
 constexpr double durationX = 5;                       // duration of the pulse for linear pulse
@@ -38,7 +39,6 @@ const PulseKind pulse_typeY = PulseKind::Sin2;
 const PulseKind pulse_wrapperY = PulseKind::Envelope;
 constexpr double sigmaY = 0.1;
 constexpr double ntt_sigmaY = 1.0;
-constexpr double ETPY = 100.0;
 constexpr double delayY = 0.0;
 constexpr int number_of_cycleY = 10;
 constexpr double durationY = 5; // duration of the pulse for linear pulse
@@ -222,10 +222,12 @@ int main(int argc, char *argv[])
         os << "b2[0] = " << b2[0] << ", b2[1] = " << b2[1] << "\n";
         os << "k_origin[0] = " << k_origin[0] << ", k_origin[1] = " << k_origin[1] << "\n";
 
+        os << "TIME_DIVISION = " << TIME_DIVISION << "\n";
+        os << "ETP = " << ETP << "\n";
+
         os << "A0X = " << A0X << "\n";
         if (A0X != 0.0)
         {
-            os << "ETPX = " << ETPX << "\n";
             os << "delayX = " << delayX << "\n";
             if (pulse_wrapperX == PulseKind::Envelope)
             {
@@ -269,7 +271,6 @@ int main(int argc, char *argv[])
         os << "A0Y = " << A0Y << "\n";
         if (A0Y != 0.0)
         {
-            os << "ETPY = " << ETPY << "\n";
             os << "delayY = " << delayY << "\n";
             if (pulse_wrapperY == PulseKind::Envelope)
             {
@@ -322,7 +323,8 @@ int main(int argc, char *argv[])
         printf("Using %d threads.\n", nthreads);
         std::cout << "\n--- STARTING SIMULATION ---\n";
 
-        print_core_parameters(std::cout); // <-- Lambda call
+        std::cout << std::setprecision(6);   // match parameters.txt exactly
+        print_core_parameters(std::cout);
         std::cout << "\n-----------------------------------------------------------------------------\n";
         printCurrentDateTime();
         std::cout << "\n-----------------------------------------------------------------------------\n";
@@ -340,8 +342,8 @@ int main(int argc, char *argv[])
 
     try
     {
-        const PulseType PulseObjectX(pulse_typeX, pulse_wrapperX, A0X, sigmaX, ntt_sigmaX, nuX, ETPX, delayX, number_of_cycleX, durationX);
-        const PulseType PulseObjectY(pulse_typeY, pulse_wrapperY, A0Y, sigmaY, ntt_sigmaY, nuY, ETPY, delayY, number_of_cycleY, durationY);
+        const PulseType PulseObjectX(pulse_typeX, pulse_wrapperX, A0X, sigmaX, ntt_sigmaX, nuX, ETP, delayX, number_of_cycleX, durationX);
+        const PulseType PulseObjectY(pulse_typeY, pulse_wrapperY, A0Y, sigmaY, ntt_sigmaY, nuY, ETP, delayY, number_of_cycleY, durationY);
 
         double initial_time = 0.0;
         double final_time = 0.0;
@@ -367,8 +369,6 @@ int main(int argc, char *argv[])
                 std::cerr << "Error: At least one of the pulses should be non-zero\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-
-        const int TIME_DIVISION = 1000;
 
         const int calculated_divisions = static_cast<int>(std::floor(TIME_DIVISION * (final_time - initial_time)));
         const int division = std::max(calculated_divisions, TIME_DIVISION);
@@ -426,6 +426,9 @@ int main(int argc, char *argv[])
             }
             else
             {
+                // Results: full round-trip precision. General format, NOT std::fixed --
+                // Jy spans ~1e-18..1e-7 and fixed notation would flush the small end to zero.
+                file << std::setprecision(17);
                 file << "Time,Ax,Ay,Jx,Jy\n";
                 for (size_t i = 0; i < Time.size(); ++i)
                 {
@@ -446,6 +449,7 @@ int main(int argc, char *argv[])
             }
             else
             {
+                file << std::setprecision(6);   // contract: matches format_number(".6g") in Python
                 print_core_parameters(file);
 
                 file << "initial time = " << initial_time << "\n";
