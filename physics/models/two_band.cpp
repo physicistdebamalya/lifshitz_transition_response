@@ -49,42 +49,61 @@ const Eigen::Vector2d b1{4.0, 0.0};
 const Eigen::Vector2d b2{0.0, 4.0};
 const Eigen::Vector2d k_origin{-2.0, -2.0};
 
+// Basis indices for the 2-band Hamiltonian. Positional and generic -- this
+// model has no spin or particle-hole structure, so a label like Up/Dn
+// borrowed from a BdG model would assert a symmetry that isn't here.
+enum Basis
+{
+    State0,
+    State1
+};
+
+// Peierls-shifted momentum. Computed once, in one place, and reused by both
+// Hamiltonian and velocity_operator below.
+inline Eigen::Vector2d shifted_momentum(const Eigen::Vector2d &k, const Eigen::Vector2d &A)
+{
+    return k - constants::e * A;
+}
+
+// The Hamiltonian has exactly one off-diagonal entry (State0,State1); the
+// other one is its conjugate. off_diag and D_off_diag are the entry and its
+// k-gradient -- update both together, since velocity_operator is built
+// entirely from D_off_diag rather than re-derived independently.
+inline c_d off_diag(const Eigen::Vector2d &p)
+{
+    return alpha * pow(p[0], 2) - delta - constants::z * beta * p[1];
+}
+
+inline Eigen::Vector2cd D_off_diag(const Eigen::Vector2d &p)
+{
+    return Eigen::Vector2cd{2.0 * alpha * p[0], -constants::z * beta};
+}
+
 Eigen::Matrix2cd Hamiltonian(const Eigen::Vector2d &k, const Eigen::Vector2d &A)
 {
-    Eigen::Matrix2cd Ham;
+    Eigen::Matrix2cd Ham = Eigen::Matrix2cd::Zero();
+    const Eigen::Vector2d p = shifted_momentum(k, A);
 
-    c_d Hr1c1 = m;
-    c_d Hr1c2 = alpha * pow(k[0] - constants::e * A[0], 2) - delta - constants::z * beta * (k[1] - constants::e * A[1]);
+    Ham(State0, State0) = m;
+    Ham(State1, State1) = -m;
 
-    c_d Hr2c1 = alpha * pow(k[0] - constants::e * A[0], 2) - delta + constants::z * beta * (k[1] - constants::e * A[1]);
-    c_d Hr2c2 = -m;
+    const c_d h01 = off_diag(p);
+    Ham(State0, State1) = h01;
+    Ham(State1, State0) = std::conj(h01);
 
-    Ham << Hr1c1, Hr1c2,
-        Hr2c1, Hr2c2;
     return Ham;
 }
 
 std::array<Eigen::Matrix2cd, 2> velocity_operator(const Eigen::Vector2d &k, const Eigen::Vector2d &A)
 {
-    std::array<Eigen::Matrix2cd, 2> co;
+    std::array<Eigen::Matrix2cd, 2> co = {Eigen::Matrix2cd::Zero(), Eigen::Matrix2cd::Zero()};
+    const Eigen::Vector2cd D = D_off_diag(shifted_momentum(k, A));
 
-    c_d cox1c1 = 0.0;
-    c_d cox1c2 = 2 * (k[0] - constants::e * A[0]) * alpha;
+    co[0](State0, State1) = D[0];
+    co[0](State1, State0) = std::conj(D[0]);
 
-    c_d cox2c1 = 2 * (k[0] - constants::e * A[0]) * alpha;
-    c_d cox2c2 = 0.0;
-
-    co[0] << cox1c1, cox1c2,
-        cox2c1, cox2c2;
-
-    c_d coy1c1 = 0.0;
-    c_d coy1c2 = -constants::z * beta;
-
-    c_d coy2c1 = constants::z * beta;
-    c_d coy2c2 = 0.0;
-
-    co[1] << coy1c1, coy1c2,
-        coy2c1, coy2c2;
+    co[1](State0, State1) = D[1];
+    co[1](State1, State0) = std::conj(D[1]);
 
     return co;
 }

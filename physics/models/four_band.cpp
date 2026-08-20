@@ -49,110 +49,99 @@ const Eigen::Vector2d b1{12.0, 0.0};
 const Eigen::Vector2d b2{0.0, 12.0};
 const Eigen::Vector2d k_origin{-6.0, -6.0};
 
+// Basis indices for the 4-band Hamiltonian. Positional and generic: this
+// model has no spin structure, so a label borrowed from a BdG model (Up/Dn)
+// would assert an identity the basis doesn't have.
+enum Basis
+{
+    State0,
+    State1,
+    State2,
+    State3
+};
+
+// Peierls-shifted momentum, in the p+/p- combination the Hamiltonian is
+// written in. Computed once and reused by both Hamiltonian and
+// velocity_operator below.
+inline c_d shifted_momentum(const Eigen::Vector2d &k, const Eigen::Vector2d &A)
+{
+    const double px = k[0] - constants::e * A[0];
+    const double py = k[1] - constants::e * A[1];
+    return c_d(px, py);
+}
+
+// The off-diagonal Hamiltonian is two Peierls-linear couplings, v and v3.
+// term_v occupies two conjugate-mirrored position pairs, term_v3 occupies
+// one. D_term_v / D_term_v3 are their k-gradients -- update a term and its
+// derivative together, since velocity_operator is built entirely from the
+// D_* functions rather than re-derived independently. Both gradients are
+// themselves constant (v, v3 enter linearly in k), which is why
+// velocity_operator below does not depend on k or A at all.
+inline c_d term_v(const c_d &p_minus) { return v * p_minus; }
+inline c_d term_v3(const c_d &p_plus) { return v3 * p_plus; }
+
+inline Eigen::Vector2cd D_term_v() { return Eigen::Vector2cd{v, -constants::z * v}; }
+inline Eigen::Vector2cd D_term_v3() { return Eigen::Vector2cd{v3, constants::z * v3}; }
+
 Eigen::Matrix4cd Hamiltonian(const Eigen::Vector2d &k, const Eigen::Vector2d &A)
 {
-    Eigen::Matrix4cd Ham;
+    Eigen::Matrix4cd H = Eigen::Matrix4cd::Zero();
 
-    // Peierls substitution for generalized momenta
-    double px = k[0] - constants::e * A[0];
-    double py = k[1] - constants::e * A[1];
+    const c_d p_plus = shifted_momentum(k, A);
+    const c_d p_minus = std::conj(p_plus);
 
-    c_d pPlus = c_d(px, py);
-    c_d pMinus = c_d(px, -py);
+    H(State0, State0) = V / 2.0;
+    H(State1, State1) = V / 2.0;
+    H(State2, State2) = -V / 2.0;
+    H(State3, State3) = -V / 2.0;
 
-    // Row 1
-    c_d Hr1c1 = V / 2.0;
-    c_d Hr1c2 = v * pMinus;
-    c_d Hr1c3 = 0.0;
-    c_d Hr1c4 = v3 * pPlus;
+    // v couples (State0,State1) and (State2,State3) identically -- computed
+    // once, reused for both pairs, mirrored entries taken by conjugation.
+    const c_d v_term = term_v(p_minus);
+    H(State0, State1) = v_term;
+    H(State1, State0) = std::conj(v_term);
+    H(State2, State3) = v_term;
+    H(State3, State2) = std::conj(v_term);
 
-    // Row 2
-    c_d Hr2c1 = v * pPlus;
-    c_d Hr2c2 = V / 2.0;
-    c_d Hr2c3 = gamma1;
-    c_d Hr2c4 = 0.0;
+    const c_d v3_term = term_v3(p_plus);
+    H(State0, State3) = v3_term;
+    H(State3, State0) = std::conj(v3_term);
 
-    // Row 3
-    c_d Hr3c1 = 0.0;
-    c_d Hr3c2 = gamma1;
-    c_d Hr3c3 = -V / 2.0;
-    c_d Hr3c4 = v * pMinus;
+    H(State1, State2) = gamma1;
+    H(State2, State1) = gamma1;
 
-    // Row 4
-    c_d Hr4c1 = v3 * pMinus;
-    c_d Hr4c2 = 0.0;
-    c_d Hr4c3 = v * pPlus;
-    c_d Hr4c4 = -V / 2.0;
-
-    Ham << Hr1c1, Hr1c2, Hr1c3, Hr1c4,
-        Hr2c1, Hr2c2, Hr2c3, Hr2c4,
-        Hr3c1, Hr3c2, Hr3c3, Hr3c4,
-        Hr4c1, Hr4c2, Hr4c3, Hr4c4;
-
-    return Ham;
+    return H;
 }
+
+// Every entry below is a compile-time-constant expression of v, v3 and
+// constants::z (see D_term_v/D_term_v3 above), so there is nothing left to
+// recompute per call. Built once here instead of on every observed
+// timestep, for every k, across every thread.
+const std::array<Eigen::Matrix4cd, 2> VelocityOperatorConst = [] {
+    std::array<Eigen::Matrix4cd, 2> co = {Eigen::Matrix4cd::Zero(), Eigen::Matrix4cd::Zero()};
+
+    const Eigen::Vector2cd Dv = D_term_v();
+    co[0](State0, State1) = Dv[0];
+    co[0](State1, State0) = std::conj(Dv[0]);
+    co[0](State2, State3) = Dv[0];
+    co[0](State3, State2) = std::conj(Dv[0]);
+    co[1](State0, State1) = Dv[1];
+    co[1](State1, State0) = std::conj(Dv[1]);
+    co[1](State2, State3) = Dv[1];
+    co[1](State3, State2) = std::conj(Dv[1]);
+
+    const Eigen::Vector2cd Dv3 = D_term_v3();
+    co[0](State0, State3) = Dv3[0];
+    co[0](State3, State0) = std::conj(Dv3[0]);
+    co[1](State0, State3) = Dv3[1];
+    co[1](State3, State0) = std::conj(Dv3[1]);
+
+    return co;
+}();
 
 std::array<Eigen::Matrix4cd, 2> velocity_operator([[maybe_unused]] const Eigen::Vector2d &k, [[maybe_unused]] const Eigen::Vector2d &A)
 {
-    std::array<Eigen::Matrix4cd, 2> co;
-
-    // --- x-component (Derivative with respect to k_x) ---
-    // pPlus = k_x + i*k_y -> dpPlus/dk_x = 1
-    // pMinus = k_x - i*k_y -> dpMinus/dk_x = 1
-    c_d cox1c1 = 0.0;
-    c_d cox1c2 = v;
-    c_d cox1c3 = 0.0;
-    c_d cox1c4 = v3;
-
-    c_d cox2c1 = v;
-    c_d cox2c2 = 0.0;
-    c_d cox2c3 = 0.0;
-    c_d cox2c4 = 0.0;
-
-    c_d cox3c1 = 0.0;
-    c_d cox3c2 = 0.0;
-    c_d cox3c3 = 0.0;
-    c_d cox3c4 = v;
-
-    c_d cox4c1 = v3;
-    c_d cox4c2 = 0.0;
-    c_d cox4c3 = v;
-    c_d cox4c4 = 0.0;
-
-    co[0] << cox1c1, cox1c2, cox1c3, cox1c4,
-        cox2c1, cox2c2, cox2c3, cox2c4,
-        cox3c1, cox3c2, cox3c3, cox3c4,
-        cox4c1, cox4c2, cox4c3, cox4c4;
-
-    // --- y-component (Derivative with respect to k_y) ---
-    // pPlus = k_x + i*k_y -> dpPlus/dk_y = i
-    // pMinus = k_x - i*k_y -> dpMinus/dk_y = -i
-    c_d coy1c1 = 0.0;
-    c_d coy1c2 = -constants::z * v;
-    c_d coy1c3 = 0.0;
-    c_d coy1c4 = constants::z * v3;
-
-    c_d coy2c1 = constants::z * v;
-    c_d coy2c2 = 0.0;
-    c_d coy2c3 = 0.0;
-    c_d coy2c4 = 0.0;
-
-    c_d coy3c1 = 0.0;
-    c_d coy3c2 = 0.0;
-    c_d coy3c3 = 0.0;
-    c_d coy3c4 = -constants::z * v;
-
-    c_d coy4c1 = -constants::z * v3;
-    c_d coy4c2 = 0.0;
-    c_d coy4c3 = constants::z * v;
-    c_d coy4c4 = 0.0;
-
-    co[1] << coy1c1, coy1c2, coy1c3, coy1c4,
-        coy2c1, coy2c2, coy2c3, coy2c4,
-        coy3c1, coy3c2, coy3c3, coy3c4,
-        coy4c1, coy4c2, coy4c3, coy4c4;
-
-    return co;
+    return VelocityOperatorConst;
 }
 
 // *****************************************************************************
