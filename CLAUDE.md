@@ -98,9 +98,32 @@ Outside the repository, never in git:
 ~/research_backup/PostDoc/programming/new/data/   mirror
 ```
 
-## Still to do
+## How a parameter point becomes a job
 
-The task.csv pass: model parameters are still compile-time `constexpr`, so a
-parameter point costs a full recompile and `workflow/submit_utils.py` reaches
-them by rewriting the source. `build_replacements()` is the single seam where
-that gets replaced by a runtime schema-validated `task.csv`.
+Model parameters are compile-time `constexpr` in `physics/models/*.cpp`, and a
+parameter point is realised by rewriting that source and recompiling. This is
+the mechanism, not a stopgap.
+
+```
+sweep dict -> already_exists()? -> dir_NNNNN -> change_lines() -> compile
+           -> job.sh -> sbatch -> directories.txt
+```
+
+`change_lines()` raises on an unmatched prefix. It must never be made lenient:
+a silent miss means a job runs with the wrong parameter and lands in the
+archive labelled as something it is not.
+
+`build_replacements()` derives the substitution list from the schema in
+`analysis/models.py`, so adding a parameter is one edit there rather than
+thirty call sites. Adding one means touching three places that must agree:
+the `constexpr` in the model source, `print_core_parameters()` next to it, and
+`ModelSchema.scalars`. `verify_cpp_mirror()` catches the third going stale.
+
+Each run directory gets `workflow/Makefile.job` as its `Makefile`. It compiles
+only the rewritten model source and links
+`physics/build/$HOST/necessary_functions.o`, which `make -C physics` built
+once. Rebuilding that Eigen + odeint translation unit per job would dominate
+submission time.
+
+A compile or sbatch failure quarantines the directory into `incomplete_runs/`
+and the sweep continues.
