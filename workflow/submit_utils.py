@@ -43,6 +43,10 @@ BACKUP_DIRNAME    = "incomplete_runs"
 DIRECTORIES_TXT   = "directories.txt"
 LOCKFILE          = ".submit_lock"
 MASTER_LOG        = "logfile.txt"
+# Set in the driver job's environment so the generator, on re-entry,
+# knows it is already on a compute node and should run the loop rather
+# than dispatch a second one. Mirrors AM5's LAUNCHED_BY_GENERATOR.
+DRIVER_ENV        = "NEW_SWEEP_DRIVER"
 
 
 @lru_cache(maxsize=8)
@@ -56,6 +60,29 @@ def count_running_jobs(user, partition):
     out = subprocess.run(f"squeue -u {user} -p {partition} --noheader | wc -l",
                          shell=True, capture_output=True, text=True)
     return int(out.stdout.strip() or 0)
+
+
+def cpus_in_use(user):
+    """Cores this user holds RUNNING, cluster-wide -- the unit and the scope
+    the QoS ceiling actually enforces.
+
+    `fatqos` caps MaxTRESPU at cpu=80 across small+medium+large together, so a
+    throttle that counts jobs in one partition measures the wrong thing twice
+    over: wrong unit (a 64-core job and a 32-core job are not interchangeable)
+    and wrong scope (work queued on medium is invisible while submitting to
+    large). Adapted from Superconductivity/python/submit_utils_Phase.py.
+
+    PENDING jobs hold no TRES yet -- that is exactly why SLURM lets them queue
+    rather than rejecting them -- so they are deliberately not counted.
+    Returns None if squeue cannot be reached, which the caller must treat as
+    "unknown", never as "zero".
+    """
+    try:
+        out = subprocess.run(["squeue", "-u", user, "-t", "running", "-h", "-o", "%C"],
+                             capture_output=True, text=True, check=True, timeout=30)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return sum(int(n) for n in out.stdout.split())
 
 
 def get_active_job_info(user):
@@ -93,7 +120,13 @@ class Submitter:
                   "max_concurrent_jobs", "slurm_user"):
             setattr(self, k, getattr(self.host, k))
 
+        # Cluster-wide core ceiling this user is subject to. Unknown on hosts
+        # with no profiled QoS, where an effectively infinite budget makes
+        # wait_for_slot fall back to the job-count limit alone.
+        self.cpu_budget = getattr(self.host, "cpu_budget", 10 ** 9)
+
         self._lockfile = None
+        self._warned_missing_logs = set()
 
     # ----------------------------------------------------------- partition --
     def use_partition(self, name, nodes=1):
@@ -127,32 +160,46 @@ class Submitter:
                                          partitions=self.host.partitions)
         for k, v in plan.items():
             setattr(self, k, v)
-
-        p = self.host.partitions[name]
-        used = plan["nodes"] * plan["npn"] * plan["cpt"]
-        print(f"partition={p.name}  {plan['nodes']} node(s) x {plan['npn']} "
-              f"rank(s) x {plan['cpt']} thread(s) = {used} cores/job, "
-              f"{plan['max_concurrent_jobs']} concurrent "
-              f"({used * plan['max_concurrent_jobs']}/{p.cpu_cap} core cap)  "
-              f"[{p.cpu}, walltime {p.walltime}]", flush=True)
-
-        # The cap can force a layout that no longer fills a node -- ask for 3
-        # medium nodes and 96 > 80, so cpt drops to 13 and 6 cores per node go
-        # unused. That is a legal job and it will run, but it is not what the
-        # "one rank per NUMA domain, fill the node" rule promises, so say so
-        # rather than let the printed numbers look tuned when they are not.
-        per_node = plan["npn"] * plan["cpt"]
-        if per_node != p.cores_per_node:
-            remedy = ("Fewer nodes would use each one fully."
-                      if p.cores_per_node <= p.cpu_cap else
-                      f"Inherent to this queue -- its {p.cpu_cap}-core QoS cap "
-                      f"is smaller than one {p.cores_per_node}-core node, so "
-                      f"no node count fills it. Use it for smoke tests only.")
-            print(f"  ⚠️  {per_node} of {p.cores_per_node} cores per node in "
-                  f"use: {plan['nodes']} x {p.cores_per_node} exceeds the "
-                  f"{p.cpu_cap}-core cap, so threads per rank were reduced to "
-                  f"fit. {remedy}", flush=True)
+        self.cpu_budget = self.host.partitions[name].cpu_cap
+        # Deliberately silent. This used to print what it had chosen, which
+        # read as authoritative and was not: anything assigned afterwards
+        # (s.nodes = 1, say) changed the job without changing the line already
+        # on screen. resource_summary() is printed once, later, from the
+        # values that actually reach job.sh.
         return self
+
+    def resource_summary(self):
+        """The one report of what this sweep will ask SLURM for.
+
+        Built from the live attributes at the moment it is called, so it
+        cannot disagree with the #SBATCH block the way a message printed
+        early in configuration can.
+        """
+        need = self.cores_per_job()
+        lines = [f"host={self.host.name}  partition={self.partition}  qos={self.qos}",
+                 f"  {self.nodes} node(s) x {self.npn} rank(s) x {self.cpt} "
+                 f"thread(s) = {need} cores/job, up to "
+                 f"{self.max_concurrent_jobs} at once"]
+
+        p = (self.host.partitions or {}).get(self.partition)
+        if p is None:
+            lines.append(f"  no profiled table for {self.partition!r} on "
+                         f"{self.host.name} — npn/cpt are unchecked")
+            return "\n".join(lines)
+
+        lines[-1] += (f"  ({min(self.cpu_budget, self.max_concurrent_jobs * need)}"
+                      f"/{p.cpu_cap} core budget)")
+        lines.append(f"  {p.cpu}, {p.cores_per_node} cores/node, "
+                     f"{p.numa_per_node} NUMA domain(s), walltime {p.walltime}")
+
+        per_node = self.npn * self.cpt
+        if per_node != p.cores_per_node:
+            lines.append(f"  ⚠️  {per_node} of {p.cores_per_node} cores per node "
+                         f"in use — this layout does not fill a node")
+        if need > p.cpu_cap:
+            lines.append(f"  ⚠️  one job needs {need} cores but the cap is "
+                         f"{p.cpu_cap} — it will never start")
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------- lock --
     def acquire_lock(self):
@@ -183,7 +230,15 @@ class Submitter:
         """
         log_path = Path(data_path or self.data_path) / master_log
         if not log_path.exists():
-            print(f"⚠️  no logfile at {log_path} — cannot skip duplicates", flush=True)
+            # Once, not once per point. A missing archive is a fact about the
+            # machine, not about this parameter point -- on a cluster the
+            # archive simply lives on the workstation -- so repeating it for
+            # all 207 points buries the submission log in a message that
+            # cannot change between iterations.
+            if log_path not in self._warned_missing_logs:
+                self._warned_missing_logs.add(log_path)
+                print(f"⚠️  no logfile at {log_path} — cannot skip duplicates; "
+                      f"every point will be submitted as new", flush=True)
             return False
         entries = _parse_cached(str(log_path), self.schema.system)
         snpt = CreateSnippet(p, self.schema,
@@ -208,7 +263,7 @@ class Submitter:
                 continue
         return False
 
-    def preparing_run(self):
+    def preparing_run(self, interactive=None):
         """Return how many leading directories in directories.txt are finished,
         so a resumed sweep picks up where it stopped.
 
@@ -258,6 +313,21 @@ class Submitter:
                    "could NOT reach squeue — verify none of these are still "
                    "running before choosing 'begin'")
         print(f"\n{len(lines) - start_index} incomplete run(s) ({checked}).", flush=True)
+
+        # Inside a batch job there is no stdin: input() would block until the
+        # walltime killed the job, hours later, with nothing in the log to say
+        # why. The resume/begin decision belongs on the login node, before
+        # dispatch, which is where the generator makes it.
+        if interactive is None:
+            interactive = sys.stdin.isatty()
+        if not interactive:
+            raise SystemExit(
+                f"{len(lines) - start_index} incomplete run(s) need a "
+                f"resume/begin decision, but this process has no terminal to "
+                f"ask on. Run the generator from a login-node shell (it makes "
+                f"this call before dispatching), or clear "
+                f"{DIRECTORIES_TXT} by hand.")
+
         choice = input("  [resume] quarantine them and continue, "
                        "[begin] delete and start over, [abort]: ").strip().lower()
 
@@ -361,11 +431,10 @@ class Submitter:
 
         # Only a real submission needs the engine object present. A dry run on
         # a laptop targeting `param` legitimately cannot have one.
-        engine = repo / "physics" / "build" / self.host.name / "necessary_functions.o"
-        if not self.dry_run and not engine.exists():
-            raise FileNotFoundError(
-                f"engine object missing: {engine}\n"
-                f"run `make -C {repo/'physics'} HOST={self.host.name}` first")
+        if not self.dry_run:
+            self.ensure_engine(repo)
+
+        validate_point(p)
 
         run_dir = self.new_run_dir()
         target = run_dir / f"{self.model}.cpp"
@@ -383,9 +452,8 @@ class Submitter:
                   f"({self.model}.cpp rewritten, not compiled)", flush=True)
             return run_dir
 
-        cmd = f"make MODEL={self.model} HOST={self.host.name} REPO={repo}"
-        if self.host.modules:
-            cmd = f"{self.host.module_block().replace(chr(10), ' && ')} && {cmd}"
+        cmd = self._with_modules(
+            f"make MODEL={self.model} HOST={self.host.name} REPO={repo}")
 
         try:
             subprocess.run(cmd, shell=True, check=True, executable="/bin/bash",
@@ -407,6 +475,106 @@ class Submitter:
         self.record_directory(run_dir)
         return run_dir
 
+    # ------------------------------------------------------- build & launch --
+    def _with_modules(self, cmd):
+        """Prefix a command with this host's module block.
+
+        Every compile the generator drives goes through here, so `module purge
+        && module load ...` is never something the user has to remember or
+        type. Empty module tuple (local) leaves the command untouched.
+        """
+        if not self.host.modules:
+            return cmd
+        return f"{self.host.module_block().replace(chr(10), ' && ')} && {cmd}"
+
+    def ensure_engine(self, repo=None):
+        """Build physics/build/<host>/necessary_functions.o if it is absent.
+
+        This used to be a FileNotFoundError telling you to go run make. The
+        generator already knows the host, the modules and the repo, so there
+        was nothing for that message to obtain that it did not already have.
+        """
+        repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
+        engine = repo / "physics" / "build" / self.host.name / "necessary_functions.o"
+        if engine.exists():
+            return engine
+
+        print(f"building the engine object for host={self.host.name} "
+              f"(once; every run links it)", flush=True)
+        cmd = self._with_modules(
+            f"make -C {repo/'physics'} HOST={self.host.name} "
+            f"build/{self.host.name}/necessary_functions.o")
+        r = subprocess.run(cmd, shell=True, executable="/bin/bash",
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not engine.exists():
+            tail = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
+            raise SystemExit(f"engine build failed:\n{tail}")
+        print(f"  -> {engine}", flush=True)
+        return engine
+
+    def should_dispatch(self):
+        """True when the sweep loop ought to move to a compute node."""
+        return (self.host.name != "local"
+                and not self.dry_run
+                and os.environ.get(DRIVER_ENV) != "1")
+
+    def dispatch_to_compute_node(self, generator, argv=(), walltime=None):
+        """Run the submission loop itself as a batch job, as generator_AM5.py
+        does.
+
+        The loop is not bookkeeping: for every one of 200+ points it rewrites
+        the model source and invokes g++ on an Eigen translation unit. Doing
+        that on the login node is hours of compilation on a machine shared by
+        everyone on the cluster. The engine object is built here first (once,
+        cheap) and the per-point compiles happen inside the job.
+
+        One core is the right size: the compiles are sequential and each is
+        single-threaded, so more would sit idle while still counting against
+        the QoS ceiling.
+        """
+        generator = Path(generator).resolve()
+        p = (self.host.partitions or {}).get(self.partition)
+        walltime = walltime or (p.walltime if p else "1-00:00:00")
+
+        script = self.cwd / f"driver_{self.model}.sh"
+        lines = ["#!/bin/bash",
+                 f"#SBATCH --job-name={self.job_name}_driver",
+                 f"#SBATCH --partition={self.partition}",
+                 f"#SBATCH --qos={self.qos}",
+                 "#SBATCH --nodes=1",
+                 "#SBATCH --ntasks-per-node=1",
+                 "#SBATCH --cpus-per-task=1",
+                 f"#SBATCH --time={walltime}",
+                 f"#SBATCH --output=driver_{self.model}_%j.out",
+                 f"#SBATCH --error=driver_{self.model}_%j.err",
+                 *self.host.extra_sbatch,
+                 ""]
+        if self.host.modules:
+            lines += [self.host.module_block(), ""]
+        lines += ["cd $SLURM_SUBMIT_DIR", ""]
+
+        # Carry whatever Python is running this over into the job. Without it
+        # the driver gets the system python3, which has neither numpy nor this
+        # project's imports.
+        venv = Path(sys.prefix)
+        if sys.prefix != sys.base_prefix and (venv / "bin" / "activate").exists():
+            lines += [f"source {venv / 'bin' / 'activate'}", ""]
+
+        lines += [f"export {DRIVER_ENV}=1",
+                  "",
+                  " ".join(["python3", str(generator), *map(str, argv)]),
+                  ""]
+        script.write_text("\n".join(lines))
+
+        r = subprocess.run(["sbatch", script.name], cwd=self.cwd,
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"could not submit the driver job:\n{r.stderr.strip()}")
+        print(r.stdout.strip(), flush=True)
+        print(f"the sweep now runs on a compute node; watch it with\n"
+              f"  tail -f {self.cwd}/driver_{self.model}_<jobid>.out", flush=True)
+        return r.stdout.strip()
+
     def _quarantine(self, run_dir, why, detail=""):
         """Move a failed run dir aside so it can be inspected, without letting
         it look like a pending job to preparing_run()."""
@@ -426,10 +594,82 @@ class Submitter:
             tail = "\n".join(detail.strip().splitlines()[-8:])
             print(f"      {tail}", flush=True)
 
-    def wait_for_slot(self, poll=300):
-        while count_running_jobs(self.slurm_user, self.partition) >= self.max_concurrent_jobs:
-            print("⏳ waiting for a job slot...", flush=True)
+    def cores_per_job(self):
+        return self.nodes * self.npn * self.cpt
+
+    def wait_for_slot(self, poll=120):
+        """Block until this job's cores fit under the QoS ceiling.
+
+        Two limits, and they mean different things. The cluster-wide core
+        budget is what SLURM enforces: exceed it and jobs sit pending on
+        QOSMaxCpuPerUserLimit, which is not an error but does mean the
+        submission loop races ahead of what can actually start.
+        max_concurrent_jobs is the politeness knob on top of that -- how much
+        of the budget this one sweep is willing to occupy.
+        """
+        need = self.cores_per_job()
+        budget = min(self.cpu_budget, self.max_concurrent_jobs * need)
+        warned = False
+        while True:
+            used = cpus_in_use(self.slurm_user)
+            if used is None:
+                if not warned:
+                    print("⚠️  squeue unreachable — cannot throttle; submitting "
+                          "without a core check", flush=True)
+                return
+            if used + need <= budget:
+                return
+            if not warned:
+                print(f"⏳ {used} core(s) running, this job needs {need}, "
+                      f"budget {budget} — waiting", flush=True)
+                warned = True
             time.sleep(poll)
+
+
+# ---------------------------------------------------------------- validation --
+# The two sides do not test "is this channel off" the same way, and this keeps
+# the gap between them out of reach.
+#
+#   C++   physics/src/necessary_functions.cpp: `if (A0 == 0.0) return;`
+#         physics/models/*.cpp:                `if (A0X != 0.0 && ...)`
+#         -- exact, and deliberately so. It matches AM3.cpp, and A0 is a
+#         constexpr literal written into the source by change_lines(), not a
+#         computed quantity, so there is no rounding error for a tolerance to
+#         absorb.
+#
+#   Python analysis/snippets.py: format_number() flushes |x| < 1e-12 to zero,
+#         and emit_pulse() then treats the channel as inactive.
+#
+# For 0 < |A0| < 1e-12 they disagree: C++ would write A0X plus every pulse
+# field for that axis, while the query built from the same dict would carry
+# `A0X = 0` and no pulse fields at all. The subset match then fails and the
+# run becomes permanently unfindable -- already_exists() would resubmit it
+# forever. No sweep has ever gone near that window (amplitudes here are 0 or
+# ~0.01), so rather than change either emitter and risk the 99-run archive,
+# refuse the input that would expose the difference.
+
+_A0_MIN = 1e-12          # analysis/snippets.py:_THRESHOLD_ZERO
+
+
+def validate_point(p):
+    """Reject a parameter point that the C++ and Python emitters would
+    describe differently. Raises ValueError; never returns a verdict to
+    ignore."""
+    for axis in ("X", "Y"):
+        key = f"A0{axis}"
+        if key not in p:
+            continue
+        a0 = abs(float(p[key]))
+        if 0.0 < a0 < _A0_MIN:
+            raise ValueError(
+                f"{key} = {p[key]!r} sits in the one window where C++ and "
+                f"analysis disagree about whether a pulse channel is active: "
+                f"C++ tests A0 != 0.0 exactly, while analysis/snippets.py "
+                f"flushes |A0| < {_A0_MIN:g} to zero. The run would be "
+                f"written with every pulse field for axis {axis} and searched "
+                f"for with none of them, so it could never be found again. "
+                f"Use exactly 0.0 to switch the channel off, or an amplitude "
+                f"at or above {_A0_MIN:g}.")
 
 
 # ------------------------------------------------------------ source rewrite --

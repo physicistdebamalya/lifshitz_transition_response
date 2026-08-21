@@ -67,9 +67,12 @@ cpt         #SBATCH --cpus-per-task -- cores per rank. job.sh exports it as
             OMP_NUM_THREADS, so it is the OpenMP thread count inside a rank.
 
 max_concurrent_jobs
-            Not a SLURM directive. wait_for_slot() blocks while
-            `squeue -u <slurm_user> -p <partition>` already shows this many
-            jobs, so a long sweep trickles in instead of flooding the queue.
+            Not a SLURM directive. How much of the shared core budget this
+            one sweep is willing to occupy: wait_for_slot() blocks until
+            `cores already running + this job's cores` fits inside
+            min(cpu_budget, max_concurrent_jobs * cores_per_job).
+            Cores, not job count, because cores are what the QoS enforces --
+            see "The 80-core cap" below.
 
 slurm_user  The account passed to `squeue -u`, by both wait_for_slot() and
             preparing_run()'s live-job cross-check. A wrong value is silent
@@ -121,13 +124,13 @@ node cannot be claimed there.) Going over is not an error: the excess jobs
 simply sit pending with reason QOSMaxCpuPerUserLimit until earlier ones end.
 
 use_partition() sizes max_concurrent_jobs to fill that cap and stop -- medium
-at 1 node is 32 cores/job, so 2 jobs, 64 of 80. Two things it cannot know:
+at 1 node is 32 cores/job, so 2 jobs, 64 of 80.
 
-  - the cap counts YOUR jobs cluster-wide, so anything already running in
-    another queue eats into the same 80.
-  - wait_for_slot() throttles with `squeue -u <user> -p <partition>`, which
-    counts a single queue. Run this sweep on large while other jobs sit on
-    medium and the throttle will not see them.
+wait_for_slot() measures the same thing SLURM does: cores this user has
+RUNNING, cluster-wide (`squeue -u <user> -t running -o %C`), not jobs in one
+partition. So work already running on medium correctly eats into the budget
+of a sweep being submitted to large. Pending jobs hold no cores and are not
+counted -- which is exactly why SLURM lets them queue.
 
 How to change them
 ------------------
@@ -166,7 +169,10 @@ How to change them
        s.use_partition("large", nodes=2)  # 2 nodes, 2 x 20, 1 concurrent
 
    It sets partition, nodes, npn, cpt and max_concurrent_jobs together, from
-   the measured table in hpc_config.HPC_PARTITIONS, and prints what it chose.
+   the measured table in hpc_config.HPC_PARTITIONS. It prints nothing: the
+   one report of what will be requested is resource_summary(), printed by
+   main() after every override has been applied, so it cannot be contradicted
+   by a later assignment the way an early message can.
 
    Assigning s.partition by itself does NOT bring npn/cpt along: the seven
    attributes are copied off the host profile exactly ONCE, in
@@ -194,8 +200,21 @@ workflow/, or with workflow/ on sys.path):
     >>> print(Submitter("four_band", host="param").job_script())
 
 --dry-run is the other half of the check: it builds dir_NNNNN and rewrites
-the model source, then stops before compiling or submitting. It does not
-write job.sh, so use job_script() above to inspect the #SBATCH block.
+the model source, then stops before compiling, submitting or dispatching. It
+does not write job.sh, so use job_script() above to inspect the #SBATCH block.
+
+Where the loop runs
+===================
+On param or hpc, `python3 workflow/generator_*.py` does the interactive part
+here -- the resume/begin question, and one `make` for the shared engine
+object -- then sbatches the sweep loop itself onto a compute node and
+returns. That loop invokes g++ on an Eigen translation unit once per
+parameter point, which is not work a shared login node should be doing; the
+pattern is taken from Superconductivity's generator_AM5.py. Module purge and
+load happen automatically around every compile, on both sides.
+
+Follow it with `tail -f driver_<model>_<jobid>.out`. Use --here to keep the
+loop in the foreground instead (debugging), and --dry-run never dispatches.
 """
 
 import argparse
@@ -264,41 +283,54 @@ def sweep():
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Define the four_band sweep and submit it. On a cluster the "
+                    "submission loop is dispatched to a compute node; you only "
+                    "ever run `python3 generator_four_band.py`.")
     ap.add_argument("--dry-run", action="store_true",
-                    help="prepare run dirs and job.sh, stop before sbatch")
-    ap.add_argument("--host", default=None, help="local | param | hpc")
+                    help="prepare run dirs and rewrite sources, stop before "
+                         "compiling, sbatch or dispatch")
+    ap.add_argument("--host", default=None, help="local | param | hpc "
+                                                 "(default: autodetect from $HOME)")
     ap.add_argument("--name", default="fourband")
     ap.add_argument("--archive", default=ARCHIVE,
                     help="logfile.txt to check for already-computed points")
+    ap.add_argument("--here", action="store_true",
+                    help="run the loop in this process instead of dispatching "
+                         "it to a compute node (debugging)")
     args = ap.parse_args()
 
     s = Submitter("four_band", host=args.host, data_path=args.archive,
                   dry_run=args.dry_run)
     s.job_name = args.name
 
-    # ── Per-sweep overrides (see the module docstring) ────────────────────
-    # On hpc, ONE call picks the queue and the core layout that fits it:
+    # ── Per-sweep overrides ───────────────────────────────────────────────
+    # On hpc one call picks the queue AND the layout that fits it. It sets
+    # partition, nodes, npn, cpt and max_concurrent_jobs together -- one MPI
+    # rank per NUMA domain, sized to the QoS core cap. Never set s.partition
+    # alone; it does not carry npn/cpt with it.
     #
-    #   s.use_partition("medium")          # 1 node, 2 x 16, 2 jobs  (default)
-    #   s.use_partition("large")           # 1 node, 2 x 20, 2 jobs
-    #   s.use_partition("large", nodes=2)  # 2 nodes, 2 x 20, 1 job
-    #   s.use_partition("test")            # cn17 smoke test, 8-core QoS cap
+    # s.use_partition("large")           # 1 node,  2 x 20, 2 concurrent
+    # s.use_partition("large", nodes=2)  # 2 nodes, 2 x 20, 1 concurrent
     #
-    # It sets partition, nodes, npn, cpt and max_concurrent_jobs together:
-    # one MPI rank per NUMA domain, sized to fill the 80-core QoS cap without
-    # going over it. Never set s.partition on its own -- it does not carry
-    # npn/cpt with it, so the job lands on the new queue's nodes still split
-    # for the old queue's core count.
-    #
-    # The hpc profile already defaults to medium at 1 node, so use_partition
-    # is only needed to change queue or node count. Assignments placed AFTER
-    # it win, for anything you want to hand-tune:
-    # s.max_concurrent_jobs = 1   # how many jobs may sit in the queue at once
-    # s.npn, s.cpt = 4, 10        # only with a node layout you have verified
+    # The hpc profile already defaults to medium at 1 node, so this is only
+    # needed to change queue or node count. Anything assigned after it wins:
+    # s.max_concurrent_jobs = 1     # occupy less of the shared core budget
+    # s.npn, s.cpt = 4, 10          # only with a layout you have verified
 
     points = list(sweep())
-    print(f"host={s.host.name}  model=four_band  points={len(points)}", flush=True)
+    print(s.resource_summary(), flush=True)
+    print(f"model=four_band  points={len(points)}", flush=True)
+
+    # On a cluster the loop belongs on a compute node: it runs one g++ over an
+    # Eigen translation unit per point. The resume/begin question and the
+    # one-off engine build happen here first, while there is still a terminal
+    # to ask on and before anything is queued.
+    if s.should_dispatch() and not args.here:
+        s.preparing_run()
+        s.ensure_engine()
+        s.dispatch_to_compute_node(__file__, sys.argv[1:])
+        return
 
     if not args.dry_run:
         s.acquire_lock()
@@ -307,7 +339,7 @@ def main():
     submitted = skipped = failed = 0
     for p in points:
         if s.already_exists(p):
-            print(f"  skip ef={p['ef']:<5} nu={p['nuX']:<9} — already in the archive", flush=True)
+            print(f"  skip ef={p['ef']:<5} nu={p['nuX']:<9}", flush=True)
             skipped += 1
             continue
 
@@ -319,8 +351,8 @@ def main():
             failed += 1
             continue
         submitted += 1
-        print(f"  {'prepared' if args.dry_run else 'submitted'} ef={p['ef']:<5} nu={p['nuX']:<9} "
-              f"-> {run_dir.name}", flush=True)
+        print(f"  {'prepared' if args.dry_run else 'submitted'} ef={p['ef']:<5} nu={p['nuX']:<9}"
+              f" -> {run_dir.name}", flush=True)
 
     verb = "prepared" if args.dry_run else "submitted"
     print(f"\n{submitted} {verb}, {skipped} already present"

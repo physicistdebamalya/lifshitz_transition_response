@@ -7,18 +7,50 @@ operational source of truth.
 """
 
 import os
+import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 def detect_host():
-    """Which machine are we on? Mirrors the logic in physics/Makefile."""
+    """Which machine are we on? Decided from $HOME, same rule as
+    physics/host.mk and as Superconductivity's get_hpc_cluster().
+
+    The param test is `/home/debamalya.dutta` exists rather than
+    get_hpc_cluster()'s `"/home/" in home`, because the workstation's home is
+    /home/debamalya -- which that looser test would call `param`, silently
+    handing a laptop the cluster's module list and library paths. Everything
+    else about the rule is the same, and both agree on every real cluster.
+    """
     home = os.path.expanduser("~")
     if "/iitgn/homedirs" in home:
         return "hpc"
     if Path("/home/debamalya.dutta").exists():
         return "param"
     return "local"
+
+
+def cores_per_node_from_slurm(partition, timeout=10):
+    """Cores/node read out of SLURM instead of a second hand-kept constant.
+
+    `scontrol show partition` reports TotalCPUs and TotalNodes, so the ratio
+    is right even if the cluster's node mix changes under us. Only valid
+    where a partition's nodes are homogeneous, which is true of small,
+    medium and large here (verified: 40, 32 and 40 cores/node uniformly).
+    Returns None when SLURM is not reachable -- on a laptop, say -- and the
+    caller then keeps the profiled value. Adapted from
+    Superconductivity's CompileConfig.autodetect_npn().
+    """
+    try:
+        out = subprocess.run(["scontrol", "show", "partition", partition],
+                             capture_output=True, text=True, check=True,
+                             timeout=timeout).stdout
+        total_cpus = int(re.search(r"TotalCPUs=(\d+)", out).group(1))
+        total_nodes = int(re.search(r"TotalNodes=(\d+)", out).group(1))
+    except Exception:
+        return None
+    return total_cpus // total_nodes if total_nodes else None
 
 
 @dataclass
@@ -48,6 +80,10 @@ class HostConfig:
     # Empty means "this host has no table" -- use_partition() then refuses
     # rather than applying another machine's numbers. See HPC_PARTITIONS.
     partitions: dict = field(default_factory=dict)
+    # Cluster-wide cores this user may hold at once, when a QoS enforces one.
+    # Left effectively unbounded where no ceiling has been established, so the
+    # throttle falls back to counting jobs rather than inventing a limit.
+    cpu_budget: int = 10 ** 9
 
     def module_block(self):
         return "\n".join(["module purge"] + [f"module load {m}" for m in self.modules])
@@ -142,6 +178,21 @@ def plan_partition(name, nodes=1, partitions=None):
     npn = p.numa_per_node
     cpt = p.cores_per_numa
 
+    # The table is measured, not guessed -- but it was measured once, and the
+    # cluster can change. SLURM is the live authority on cores per node, so
+    # ask it and say something if the two disagree rather than quietly
+    # sizing jobs for hardware that is no longer there. NUMA topology cannot
+    # be read this way (scontrol reports sockets, and small runs sub-NUMA
+    # clustering at 4 domains across 2 sockets), so that still comes from
+    # the table.
+    live = cores_per_node_from_slurm(name)
+    if live is not None and live != p.cores_per_node:
+        print(f"⚠️  {name}: SLURM reports {live} cores/node but hpc_config's "
+              f"table says {p.cores_per_node}. Using SLURM's number and "
+              f"keeping {p.numa_per_node} NUMA domain(s); re-measure the "
+              f"node layout and update HPC_PARTITIONS.", flush=True)
+        cpt = max(1, live // npn)
+
     # `test` is the only queue where a full node exceeds the cap (8 < 32).
     per_job = nodes * npn * cpt
     if per_job > p.cpu_cap:
@@ -177,6 +228,7 @@ HPC = HostConfig(
     nodes=1, npn=2, cpt=16,
     max_concurrent_jobs=2,
     partitions=HPC_PARTITIONS,
+    cpu_budget=FATQOS_CPU_CAP,
     env_exports=(
         'LIBFABRIC_PATH="/iitgn/apps/spack/opt/spack/linux-rocky8-cascadelake/'
         'gcc-12.3.0/libfabric-1.22.0-kjorf5ozailt7w3dgotagzdhf5zgpcvd/lib"',
