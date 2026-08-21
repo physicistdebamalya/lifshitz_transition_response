@@ -89,6 +89,9 @@ PulseType::PulseType(const PulseKind pulse_type_, const PulseKind pulse_wrapper_
     this->ti = ti;
     this->T_pulse = 1.0 / nu;
     this->number_of_cycle_of_pulse = number_of_cycle_of_pulse;
+    this->nu = nu;                 // retained for printPulseParams(); see the
+    this->ntt_sigma = ntt_sigma;   // header comment on these three members
+    this->duration = duration;
 
     switch (pulse_type)
     {
@@ -207,5 +210,62 @@ double PulseType::PULSE(const double t) const
         }
     default:
         throw std::invalid_argument("The pulse wrapper is not supported.");
+    }
+}
+
+// Ported from Superconductivity's PulseType::printPulseParams
+// (necessary_functions.cpp there), with the phi/carrier-phase branch
+// removed: this project's pulse model has no phase parameter to report.
+//
+// Category-C emission, mirroring analysis/snippets.py's emit_pulse(): A0 is
+// always written -- it is the channel on/off switch -- and if it is zero,
+// nothing else about that channel means anything, so nothing else is
+// written. Two models call this identically (see two_band.cpp/four_band.cpp
+// main()), which is the point: this conditional structure previously lived
+// twice, hand-duplicated, inside each model's print_core_parameters lambda.
+void PulseType::printPulseParams(std::ostream &os, const std::string &axis) const
+{
+    os << "A0" << axis << " = " << A0 << "\n";
+    if (A0 == 0.0)
+        return;
+
+    os << "delay" << axis << " = " << ti << "\n";
+
+    if (pulse_wrapper == PulseKind::Envelope)
+    {
+        os << "pulse_type" << axis << " = " << pulse_type << " with Envelope" << "\n";
+        if (pulse_type == PulseKind::Gaussian)
+        {
+            os << "nu" << axis << " = " << nu << "\n";
+            os << "sigma" << axis << " = " << sigma << "\n";
+            os << "ntt_sigma" << axis << " = " << ntt_sigma << "\n";
+        }
+        else if (pulse_type == PulseKind::Sin2)
+        {
+            os << "nu" << axis << " = " << nu << "\n";
+            os << "number_of_cycle" << axis << " = " << number_of_cycle_of_pulse << "\n";
+        }
+    }
+    else if (pulse_wrapper == PulseKind::NA)
+    {
+        os << "pulse_type" << axis << " = " << pulse_type << " without Envelope" << "\n";
+        if (pulse_type == PulseKind::Gaussian)
+        {
+            os << "sigma" << axis << " = " << sigma << "\n";
+            os << "ntt_sigma" << axis << " = " << ntt_sigma << "\n";
+        }
+        else if (pulse_type == PulseKind::Sin2)
+        {
+            os << "number_of_cycle" << axis << " = " << number_of_cycle_of_pulse << "\n";
+            os << "nu" << axis << " = " << nu << "\n";
+        }
+        else if (pulse_type == PulseKind::Sin || pulse_type == PulseKind::Cos)
+        {
+            os << "nu" << axis << " = " << nu << "\n";
+        }
+        else if (pulse_type == PulseKind::Linear)
+        {
+            os << "duration" << axis << " = " << duration << "\n";
+        }
     }
 }

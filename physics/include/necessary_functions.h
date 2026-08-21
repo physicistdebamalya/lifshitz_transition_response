@@ -125,6 +125,12 @@ class PulseType
 {
 private:
     double A0, sigma, omega, T_pulse, ttotal = 0.0;
+    // nu, ntt_sigma and duration were previously constructor-only: used to
+    // derive omega/T_pulse/ttotal and then discarded. Kept as members now so
+    // printPulseParams() below can report the value the user actually gave,
+    // not a derived one -- matching Superconductivity's PulseType, which
+    // stores the same three for the same reason.
+    double nu = 0.0, ntt_sigma = 0.0, duration = 0.0;
     int number_of_cycle_of_pulse = 1;
 
     PulseKind pulse_type;
@@ -144,6 +150,16 @@ public:
               const double nu, const double ETP, const double ti, const int number_of_cycle_of_pulse, const double duration);
 
     double PULSE(const double) const;
+
+    // Category-C pulse-parameter emission (see analysis/snippets.py's
+    // three-category rule this mirrors): writes A0<axis> unconditionally,
+    // then only the fields this pulse's own shape actually uses. One
+    // definition, shared by every model's print_core_parameters instead of
+    // duplicated per model -- see necessary_functions.cpp for the exact
+    // conditional structure, ported from Superconductivity's
+    // PulseType::printPulseParams (necessary_functions.cpp there), minus the
+    // phi/carrier-phase handling that pulse model has and this one does not.
+    void printPulseParams(std::ostream &, const std::string &) const;
 
     double ti, tf;
 };

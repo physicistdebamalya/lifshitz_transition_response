@@ -155,93 +155,30 @@ int main(int argc, char *argv[])
 
         os << "TIME_DIVISION = " << TIME_DIVISION << "\n";
         os << "ETP = " << ETP << "\n";
-
-        os << "A0X = " << A0X << "\n";
-        if (A0X != 0.0)
-        {
-            os << "delayX = " << delayX << "\n";
-            if (pulse_wrapperX == PulseKind::Envelope)
-            {
-                os << "pulse_typeX = " << pulse_typeX << " with Envelope" << "\n";
-                if (pulse_typeX == PulseKind::Gaussian)
-                {
-                    os << "nuX = " << nuX << "\n";
-                    os << "sigmaX = " << sigmaX << "\n";
-                    os << "ntt_sigmaX = " << ntt_sigmaX << "\n";
-                }
-                else if (pulse_typeX == PulseKind::Sin2)
-                {
-                    os << "nuX = " << nuX << "\n";
-                    os << "number_of_cycleX = " << number_of_cycleX << "\n";
-                }
-            }
-            else if (pulse_wrapperX == PulseKind::NA)
-            {
-                os << "pulse_typeX = " << pulse_typeX << " without Envelope" << "\n";
-                if (pulse_typeX == PulseKind::Gaussian)
-                {
-                    os << "sigmaX = " << sigmaX << "\n";
-                    os << "ntt_sigmaX = " << ntt_sigmaX << "\n";
-                }
-                else if (pulse_typeX == PulseKind::Sin2)
-                {
-                    os << "number_of_cycleX = " << number_of_cycleX << "\n";
-                    os << "nuX = " << nuX << "\n";
-                }
-                else if (pulse_typeX == PulseKind::Sin || pulse_typeX == PulseKind::Cos)
-                {
-                    os << "nuX = " << nuX << "\n";
-                }
-                else if (pulse_typeX == PulseKind::Linear)
-                {
-                    os << "durationX = " << durationX << "\n";
-                }
-            }
-        }
-
-        os << "A0Y = " << A0Y << "\n";
-        if (A0Y != 0.0)
-        {
-            os << "delayY = " << delayY << "\n";
-            if (pulse_wrapperY == PulseKind::Envelope)
-            {
-                os << "pulse_typeY = " << pulse_typeY << " with Envelope" << "\n";
-                if (pulse_typeY == PulseKind::Gaussian)
-                {
-                    os << "nuY = " << nuY << "\n";
-                    os << "sigmaY = " << sigmaY << "\n";
-                    os << "ntt_sigmaY = " << ntt_sigmaY << "\n";
-                }
-                else if (pulse_typeY == PulseKind::Sin2)
-                {
-                    os << "nuY = " << nuY << "\n";
-                    os << "number_of_cycleY = " << number_of_cycleY << "\n";
-                }
-            }
-            else if (pulse_wrapperY == PulseKind::NA)
-            {
-                os << "pulse_typeY = " << pulse_typeY << " without Envelope" << "\n";
-                if (pulse_typeY == PulseKind::Gaussian)
-                {
-                    os << "sigmaY = " << sigmaY << "\n";
-                    os << "ntt_sigmaY = " << ntt_sigmaY << "\n";
-                }
-                else if (pulse_typeY == PulseKind::Sin2)
-                {
-                    os << "number_of_cycleY = " << number_of_cycleY << "\n";
-                    os << "nuY = " << nuY << "\n";
-                }
-                else if (pulse_typeY == PulseKind::Sin || pulse_typeY == PulseKind::Cos)
-                {
-                    os << "nuY = " << nuY << "\n";
-                }
-                else if (pulse_typeY == PulseKind::Linear)
-                {
-                    os << "durationY = " << durationY << "\n";
-                }
-            }
-        }
     };
+
+    // Built once, early, before any output -- so both the startup echo below
+    // and the parameters.txt write later can call the same
+    // PulseType::printPulseParams() on the same objects, matching AM3.cpp's
+    // ordering. This has its own narrow try/catch rather than sharing the
+    // big one further down: PulseType's constructor throws
+    // std::invalid_argument on an unsupported pulse_type/pulse_wrapper
+    // combination, and a run that fails here never actually started, so it
+    // should not print "STARTING SIMULATION" first.
+    PulseType PulseObjectX, PulseObjectY;
+    try
+    {
+        PulseObjectX = PulseType(pulse_typeX, pulse_wrapperX, A0X, sigmaX, ntt_sigmaX, nuX, ETP, delayX, number_of_cycleX, durationX);
+        PulseObjectY = PulseType(pulse_typeY, pulse_wrapperY, A0Y, sigmaY, ntt_sigmaY, nuY, ETP, delayY, number_of_cycleY, durationY);
+    }
+    catch (const std::exception &e)
+    {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        std::cerr << "[Rank " << rank << "] FATAL EXCEPTION: \n"
+                  << e.what() << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     if (world_rank == 0)
     {
@@ -256,6 +193,8 @@ int main(int argc, char *argv[])
 
         std::cout << std::setprecision(6);   // match parameters.txt exactly
         print_core_parameters(std::cout);
+        PulseObjectX.printPulseParams(std::cout, "X");
+        PulseObjectY.printPulseParams(std::cout, "Y");
         std::cout << "\n-----------------------------------------------------------------------------\n";
         printCurrentDateTime();
         std::cout << "\n-----------------------------------------------------------------------------\n";
@@ -273,8 +212,7 @@ int main(int argc, char *argv[])
 
     try
     {
-        const PulseType PulseObjectX(pulse_typeX, pulse_wrapperX, A0X, sigmaX, ntt_sigmaX, nuX, ETP, delayX, number_of_cycleX, durationX);
-        const PulseType PulseObjectY(pulse_typeY, pulse_wrapperY, A0Y, sigmaY, ntt_sigmaY, nuY, ETP, delayY, number_of_cycleY, durationY);
+        // PulseObjectX / PulseObjectY were already built above.
 
         double initial_time = 0.0;
         double final_time = 0.0;
@@ -383,6 +321,8 @@ int main(int argc, char *argv[])
             {
                 file << std::setprecision(6);   // contract: matches format_number(".6g") in Python
                 print_core_parameters(file);
+                PulseObjectX.printPulseParams(file, "X");
+                PulseObjectY.printPulseParams(file, "Y");
 
                 file << "initial time = " << initial_time << "\n";
                 file << "final time = " << final_time << "\n";
