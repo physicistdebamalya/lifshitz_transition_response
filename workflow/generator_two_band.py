@@ -91,12 +91,13 @@ profiles, all of which satisfy it:
     param     5     2   24     10      48      PARAM Ananta, 48 cores/node
     hpc       1     2   16      2      32      IITGN HPC2 medium, 32 cores/node
 
-npn is one rank per NUMA domain, cpt the cores inside it. That split is not
-arbitrary: ChargeCurrent() is embarrassingly parallel over k, with a single
-`omp critical` per thread and one MPI_Reduce at the very end, so neither the
-rank count nor the thread count costs communication -- but a rank straddling
-two sockets pays the interconnect for every access to its own J_thread
-buffer.
+npn is one rank per NUMA domain, cpt the cores inside it. Measured 2026-08-21
+(research_backup/setup/supercomputing_cluster/hpc_benchmark_flags.md): the
+choice is safe and optimal, but not uniquely so. OpenMPI refuses outright to
+bind a rank across two sockets, so 1x32 and 1x40 never run; among the layouts
+that do, 2x16 / 4x8 / 8x4 (medium) and 2x20 / 4x10 / 8x5 (large) agree to
+within 0.5%, and only pure MPI (cpt=1) is measurably worse -- 7% on large.
+This is the coarsest split that avoids both extremes.
 
 The hpc queues, and why the layout differs per queue
 ---------------------------------------------------

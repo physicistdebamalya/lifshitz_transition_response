@@ -152,12 +152,26 @@ def plan_partition(name, nodes=1, partitions=None):
     Two rules, both of them consequences of how the solver is parallelised
     (physics/include/necessary_functions.h, ChargeCurrent):
 
-    1. One MPI rank per NUMA domain. The k-loop is embarrassingly parallel
-       with a single `omp critical` reduction per thread and one MPI_Reduce
-       at the very end, so neither rank count nor thread count costs
-       communication. What does cost is a rank straddling two sockets and
-       reaching across the interconnect for its own J_thread buffer. So
-       npn = NUMA domains per node, cpt = cores per domain.
+    1. One MPI rank per NUMA domain: npn = NUMA domains per node, cpt =
+       cores per domain.
+
+       Measured 2026-08-21 on medium and large (see research_backup/setup/
+       supercomputing_cluster/hpc_benchmark_flags.md). The result is more
+       modest than the reason originally written here, which claimed a
+       socket-straddling rank would pay the interconnect for its J_thread
+       buffer. It never gets the chance: OpenMPI REFUSES to bind a rank
+       across two sockets ("almost always results in a loss of performance"),
+       so 1x32 and 1x40 do not run at all.
+
+       Within the non-straddling layouts the split barely matters -- 2x16 /
+       4x8 / 8x4 on medium, and 2x20 / 4x10 / 8x5 on large, agree to within
+       0.5%. That is what you would expect from a k-loop with one `omp
+       critical` per thread and a single MPI_Reduce at the end: there is
+       almost nothing for the split to influence. Only the extreme costs
+       anything -- pure MPI (cpt=1) is 7% slower on large, 2% on medium.
+
+       So this is kept as the coarsest split that never spans a socket and
+       never degenerates to pure MPI, not because finer splits are slower.
 
     2. Fill the QoS cap, do not exceed it. per_job * concurrent <= cpu_cap.
 
