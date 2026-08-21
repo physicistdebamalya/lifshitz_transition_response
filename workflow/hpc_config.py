@@ -35,6 +35,14 @@ class HostConfig:
     env_exports: tuple = ()
     mpirun_flags: str = "--mca pml ucx --mca btl ^openib"
     extra_sbatch: tuple = ()
+    # SSH endpoint for hpc_transfers.py. Empty on LOCAL, which is never a
+    # transfer target -- generator_*.py runs there directly, nothing to push.
+    # remote_home mirrors the LIBROOT pattern in physics/Makefile (param:
+    # /home/<user>, hpc: /iitgn/homedirs/<user>) -- named here once instead
+    # of re-deriving it from the host name wherever a remote path is built.
+    hostname: str = ""
+    ssh_port: int = 22
+    remote_home: str = ""
 
     def module_block(self):
         return "\n".join(["module purge"] + [f"module load {m}" for m in self.modules])
@@ -45,6 +53,8 @@ PARAM = HostConfig(
     modules=("gcc", "openmpi"),
     nodes=5, npn=2, cpt=24,        # PARAM Ananta: 5 nodes x 48 cores
     max_concurrent_jobs=25,
+    hostname="paramananta.iitgn.ac.in", ssh_port=4422,
+    remote_home="/home/debamalya.dutta",
 )
 
 HPC = HostConfig(
@@ -58,6 +68,8 @@ HPC = HostConfig(
         'CUDA_COMPAT_PATH="/iitgn/apps/packages/nvhpc/Linux_x86_64/25.3/cuda/12.8/compat"',
         "export LD_LIBRARY_PATH=${LIBFABRIC_PATH}:${CUDA_COMPAT_PATH}:${LD_LIBRARY_PATH}",
     ),
+    hostname="10.0.138.33", ssh_port=22,
+    remote_home="/iitgn/homedirs/debamalya.dutta",
 )
 
 # Not a cluster: for dry runs and small local checks.
