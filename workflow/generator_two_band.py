@@ -6,6 +6,30 @@ Define a sweep for the two-band model and submit it.
 
 Same shape as generator_four_band.py; only BASE and the swept axis differ.
 
+Sweep rules
+===========
+Any entry in BASE can be a plain scalar or a list:
+
+    scalar, or a one-element list   -> fixed
+    a list of more than one value   -> swept
+
+expand_sweep() (workflow/submit_utils.py) does the expansion -- Cartesian
+product across every swept key. ef and nu are the one exception: they are
+coupled (nu must track the band feature ef probes), so they are walked
+together via the EF_NU table below, not independently swept like everything
+else in BASE.
+
+N1, N2, b1, b2, k_origin are refused as sweep targets -- they define the
+k-grid and Brillouin-zone geometry for this run, not a physical sweep axis.
+expand_sweep() raises rather than silently expanding one. A grid-density or
+grid-geometry study is a convergence check, not this sweep; give it its own
+script if you need one.
+
+Ported from Superconductivity's AM3_old.ipynb, section "1.1 Submit jobs
+altermagnetic system AM3" -- same scalar/list rule, without the WILD
+placeholders, tagged variants or scallerDeltas machinery that section also
+has, none of which this project needs (no phase-diagram workflow here).
+
 HPC resource parameters
 =======================
 partition, qos, nodes, npn, cpt, max_concurrent_jobs, slurm_user
@@ -119,7 +143,7 @@ import numpy as np                                            # noqa: E402
 
 from data_utils import clean_path                             # noqa: E402
 from models import TWO_BAND                                   # noqa: E402
-from submit_utils import Submitter        # noqa: E402
+from submit_utils import Submitter, expand_sweep  # noqa: E402
 
 ARCHIVE = clean_path("/home/debamalya/ComputationData/PostDoc/programming/new/data/two_band_model")
 
@@ -129,21 +153,44 @@ BASE = dict(
     # Production values, read back out of the 61 archived runs -- NOT the
     # debug values left in physics/models/two_band.cpp (N1=31 etc), which are
     # there so the binary runs in seconds on a laptop.
-    alpha=1.0, beta=1.0, delta=1.0, m=0.1,
-    dephase=0.0,
-    N1=1801, N2=1801,
-    b1=[4.0, 0.0], b2=[0.0, 4.0], k_origin=[-2.0, -2.0],
+    alpha=1.0,
+    beta=1.0,
+    delta=1.0,
+    m=0.1,
+    dephase=[0.01, 0.1, 0.2],   # swept -- expand_sweep() below Cartesian-
+                                # multiplies this against every (ef, nu) pair
+    Temperature=[0.0, 0.02, 0.1],   # swept; was the standalone TEMPERATURES
+                                     # list, folded in now that BASE itself
+                                     # can carry a swept key
+
+    # -------------------------------------------
 
     TIME_DIVISION=1000,
     ETP=100.0,
 
-    A0X=0.01, pulse_typeX="sin^2", pulse_wrapperX="Envelope",
-    sigmaX=0.1, ntt_sigmaX=1.0, delayX=0.0,
-    number_of_cycleX=10, durationX=5.0,
+    A0X=0.01, 
+    pulse_typeX="sin^2", 
+    pulse_wrapperX="Envelope",
+    sigmaX=0.1, 
+    ntt_sigmaX=1.0, 
+    delayX=0.0,
+    number_of_cycleX=10, 
+    durationX=5.0,
 
-    A0Y=0.01, pulse_typeY="sin^2", pulse_wrapperY="Envelope",
-    sigmaY=0.1, ntt_sigmaY=1.0, delayY=0.0,
-    number_of_cycleY=10, durationY=5.0,
+    A0Y=0.01, 
+    pulse_typeY="sin^2", 
+    pulse_wrapperY="Envelope",
+    sigmaY=0.1, 
+    ntt_sigmaY=1.0, 
+    delayY=0.0,
+    number_of_cycleY=10, 
+    durationY=5.0,
+
+    # -------------------------------------------
+
+    N1=1801,
+    N2=1801,
+    b1=[4.0, 0.0], b2=[0.0, 4.0], k_origin=[-2.0, -2.0]
 )
 
 # nu tracks ef rather than being swept independently -- the drive has to follow
@@ -158,15 +205,18 @@ EF_NU = [
     (1.2, 0.382), (1.3, 0.414), (1.4, 0.446),
 ]
 
-TEMPERATURES = [0.0, 0.02, 0.1]
-
 
 def sweep():
-    for T in TEMPERATURES:
-        for ef, nu in EF_NU:
-            p = dict(BASE)
-            p.update(Temperature=T, ef=ef, nuX=nu, nuY=nu)
-            yield p
+    """ef and nu are coupled (nu must track the band feature ef probes) and
+    are walked together via EF_NU, not independently swept. Every other
+    BASE entry goes through expand_sweep(), so a scalar there stays fixed
+    and a list -- like Temperature or dephase above -- is swept and
+    Cartesian-multiplied against each (ef, nu) pair.
+    """
+    for ef, nu in EF_NU:
+        fixed_at_this_ef = dict(BASE)
+        fixed_at_this_ef.update(ef=ef, nuX=nu, nuY=nu)
+        yield from expand_sweep(fixed_at_this_ef)
 
 
 def main():
@@ -184,7 +234,7 @@ def main():
     # Per-sweep overrides -- uncomment to override the host profile for this
     # sweep only (see the module docstring). Keep npn * cpt equal to the
     # node's core count: param 48 (e.g. 4 x 12), hpc 32 (e.g. 4 x 8).
-    # s.nodes = 8                 # param only -- hpc's 80-core cap allows 2
+    s.nodes = 1                 # param only -- hpc's 80-core cap allows 2
     # s.npn = 4                   # MPI ranks per node
     # s.cpt = 12                  # OMP threads per rank; param 4 * 12 = 48
     # s.max_concurrent_jobs = 10  # how many jobs may sit in the queue at once
@@ -199,7 +249,8 @@ def main():
     submitted = skipped = failed = 0
     for p in points:
         if s.already_exists(p):
-            print(f"  skip T={p['Temperature']:<5} ef={p['ef']:<5} nu={p['nuX']:<6} — already in the archive", flush=True)
+            print(f"  skip T={p['Temperature']:<5} ef={p['ef']:<5} nu={p['nuX']:<6} dephase={p['dephase']:<5} "
+                 f"— already in the archive", flush=True)
             skipped += 1
             continue
 
@@ -212,7 +263,7 @@ def main():
             continue
         submitted += 1
         print(f"  {'prepared' if args.dry_run else 'submitted'} T={p['Temperature']:<5} ef={p['ef']:<5} nu={p['nuX']:<6} "
-              f"-> {run_dir.name}", flush=True)
+              f"dephase={p['dephase']:<5} -> {run_dir.name}", flush=True)
 
     verb = "prepared" if args.dry_run else "submitted"
     print(f"\n{submitted} {verb}, {skipped} already present"

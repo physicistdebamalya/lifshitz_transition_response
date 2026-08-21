@@ -5,10 +5,34 @@ Define a sweep for the four-band (bilayer graphene) model and submit it.
     python3 workflow/generator_four_band.py --dry-run
     python3 workflow/generator_four_band.py
 
-Sweep rules, following Superconductivity's generators:
-    scalar        -> fixed
-    list          -> swept
-    "?"           -> wildcard, for the dedup query only
+Sweep rules
+===========
+Any entry in BASE can be a plain scalar or a list:
+
+    scalar, or a one-element list   -> fixed
+    a list of more than one value   -> swept
+
+expand_sweep() (workflow/submit_utils.py) does the expansion -- Cartesian
+product across every swept key. ef and nu are the one exception: they are
+coupled (nu must track the band feature ef probes), so they are walked
+together via the EF_NU table below, not independently swept like everything
+else in BASE. Ported from Superconductivity's AM3_old.ipynb, section
+"1.1 Submit jobs altermagnetic system AM3" -- same scalar/list rule, without
+the WILD placeholders, tagged variants or scallerDeltas machinery that
+section also has, none of which this project needs (no phase-diagram
+workflow here).
+
+N1, N2, b1, b2, k_origin are refused as sweep targets -- they define the
+k-grid and Brillouin-zone geometry for this run, not a physical sweep axis.
+expand_sweep() raises rather than silently expanding one. A grid-density or
+grid-geometry study is a convergence check, not this sweep; give it its own
+script if you need one.
+
+"?" is a separate feature, unrelated to sweeping: analysis/snippets.py's
+CreateSnippet treats a bare "?" value as a wildcard for an already_exists()
+LOOKUP (match any value for that field). It cannot be submitted -- a run
+cannot be compiled with dephase = ?; -- so it belongs in a one-off query
+dict you build by hand, never in BASE.
 
 HPC resource parameters
 =======================
@@ -124,7 +148,7 @@ import numpy as np                                            # noqa: E402
 
 from data_utils import clean_path                             # noqa: E402
 from models import FOUR_BAND                                  # noqa: E402
-from submit_utils import Submitter        # noqa: E402
+from submit_utils import Submitter, expand_sweep  # noqa: E402
 
 ARCHIVE = clean_path("/home/debamalya/ComputationData/PostDoc/programming/new/data/four_band_model")
 
@@ -166,10 +190,15 @@ BASE = dict(
 
 
 def sweep():
+    """ef and nu are coupled and walked together via EF_NU, not independently
+    swept. Every other BASE entry goes through expand_sweep(), so a scalar
+    stays fixed (as every one of them is today) and a list would be swept --
+    see the module docstring.
+    """
     for ef, nu in EF_NU:
-        p = dict(BASE)
-        p.update(ef=ef, nuX=nu, nuY=nu)
-        yield p
+        fixed_at_this_ef = dict(BASE)
+        fixed_at_this_ef.update(ef=ef, nuX=nu, nuY=nu)
+        yield from expand_sweep(fixed_at_this_ef)
 
 
 def main():

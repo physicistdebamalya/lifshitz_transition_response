@@ -17,6 +17,7 @@ adopts the two mechanisms Superconductivity added after the notebook version:
 """
 
 import atexit
+import itertools
 import os
 import random
 import shutil
@@ -26,6 +27,8 @@ import textwrap
 import time
 from functools import lru_cache
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
 
@@ -429,3 +432,85 @@ def build_replacements(p, schema):
             rep.append((f"const PulseKind {key} = PulseKind::",
                         f"const PulseKind {key} = PulseKind::{_CPP_ENUM[p[key]]};"))
     return rep
+
+
+# ------------------------------------------------------------- sweep expansion --
+# Ported from Superconductivity's AM3_old.ipynb, section "1.1 Submit jobs
+# altermagnetic system AM3" (system_params/pulse_params + data_utils._expand_dict
+# / data_utils._normalize_value). Stripped of what this project has no use for
+# -- WILD placeholders auto-filled from a phase diagram, tagged variants,
+# scallerDeltas, the A0/lpa <-> A0X/A0Y merge -- none of which apply here:
+# new has no phase-diagram workflow. What is kept is the one rule that
+# generalises, stated in the notebook as:
+#
+#     scalar OR [scalar]   -> fixed
+#     list length > 1      -> swept
+#
+# GRID_FIXED_KEYS is new: the notebook's own generic rule would happily accept
+# a multi-value list for any key, including its b1/b2/k_origin-equivalent
+# (there, Q). This project's k-grid and Brillouin-zone geometry -- N1, N2, b1,
+# b2, k_origin -- must stay fixed for a given sweep, so expand_sweep refuses a
+# swept list on any of them rather than silently expanding one.
+
+GRID_FIXED_KEYS = frozenset({"N1", "N2", "b1", "b2", "k_origin"})
+
+# The two scalar members (N1, N2) and the three vector members (b1, b2,
+# k_origin) need different guards: a vector's own *fixed* representation is
+# already a length-2 list ([4.0, 0.0]), which the plain "list longer than
+# one element -> swept" rule would otherwise shred into two bogus scalar
+# options. VECTOR_KEYS marks the subset that needs the vector-shaped check
+# instead of the scalar one.
+VECTOR_KEYS = frozenset({"b1", "b2", "k_origin"})
+
+
+def _grid_fixed_error(key, v):
+    return ValueError(
+        f"{key} defines the k-grid/Brillouin-zone geometry and must stay "
+        f"fixed within a sweep -- got {v!r}. A grid-density or grid-geometry "
+        f"scan is a convergence study; run it as its own explicit sweep, not "
+        f"folded into this one.")
+
+
+def _sweep_values(key, v):
+    """One BASE entry -> the list of values it expands to."""
+    if isinstance(v, np.ndarray):
+        v = v.tolist()
+
+    if key in VECTOR_KEYS:
+        # Only a single flat 2-vector is accepted -- e.g. b1 = [4.0, 0.0].
+        # A list of vectors ([[4,0],[5,0]]) would mean "sweep this vector",
+        # which is exactly what GRID_FIXED_KEYS forbids for these three.
+        is_one_vector = (isinstance(v, (list, tuple)) and len(v) == 2
+                         and all(isinstance(c, (int, float)) for c in v))
+        if not is_one_vector:
+            raise _grid_fixed_error(key, v)
+        return [list(v)]
+
+    if isinstance(v, (list, tuple)):
+        if not v:
+            raise ValueError(f"{key}: empty list has nothing to sweep or fix")
+        if len(v) > 1:
+            if key in GRID_FIXED_KEYS:          # N1, N2
+                raise _grid_fixed_error(key, v)
+            return list(v)
+        return [v[0]]                  # one-element list -> fixed, like a scalar
+    return [v]                         # bare scalar -> fixed
+
+
+def expand_sweep(base):
+    """dict[str, scalar | list] -> list[dict[str, scalar]], one dict per
+    Cartesian combination of every list-valued (length > 1) entry.
+
+        expand_sweep({"A": 1, "B": [2, 3]})
+        -> [{"A": 1, "B": 2}, {"A": 1, "B": 3}]
+
+    A scalar, or a list of exactly one element, is always fixed -- so mixing
+    a swept key with ten fixed ones costs nothing but the one line that
+    actually varies. Keys that are coupled to each other (this project's
+    ef <-> nu pairing) are not expressible as an independent Cartesian
+    factor and are handled by the generator's own loop before this is
+    called; expand_sweep only ever sees the keys that vary independently.
+    """
+    keys = list(base.keys())
+    per_key = [_sweep_values(k, base[k]) for k in keys]
+    return [dict(zip(keys, combo)) for combo in itertools.product(*per_key)]
