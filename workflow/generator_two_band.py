@@ -86,7 +86,44 @@ profiles, all of which satisfy it:
     host    nodes  npn  cpt   ranks  npn*cpt   note
     local     1     2    2      2       4      laptop; dry runs and smoke tests
     param     5     2   24     10      48      PARAM Ananta, 48 cores/node
-    hpc       2     8    4     16      32      IITGN HPC2, under the 80-core cap
+    hpc       1     2   16      2      32      IITGN HPC2 medium, 32 cores/node
+
+npn is one rank per NUMA domain, cpt the cores inside it. That split is not
+arbitrary: ChargeCurrent() is embarrassingly parallel over k, with a single
+`omp critical` per thread and one MPI_Reduce at the very end, so neither the
+rank count nor the thread count costs communication -- but a rank straddling
+two sockets pays the interconnect for every access to its own J_thread
+buffer.
+
+The hpc queues, and why the layout differs per queue
+---------------------------------------------------
+    queue    nodes  cores/node  NUMA  layout   CPU                 walltime
+    small      5        40       4    4 x 10   Xeon 6230 2.10GHz     3 d
+    medium    11        32       2    2 x 16   Xeon 6130 2.10GHz     5 d
+    large     11        40       2    2 x 20   Xeon 6148 2.40GHz    10 d
+    test       1        32       2    2 x  4   cn17 only             5 h
+
+small runs with sub-NUMA clustering on -- 4 NUMA domains per node, not 2 --
+so its layout is 4 x 10 rather than large's 2 x 20, despite both having 40
+cores. That is precisely why partition and npn/cpt must move together, and
+why use_partition() exists.
+
+The 80-core cap
+---------------
+small, medium and large all run under SLURM QoS `fatqos`, whose MaxTRESPU is
+cpu=80. That is ONE shared budget of 80 cores across all three, per user --
+not 80 each. (`test` is a separate QoS, capped at 8, which is why a whole
+node cannot be claimed there.) Going over is not an error: the excess jobs
+simply sit pending with reason QOSMaxCpuPerUserLimit until earlier ones end.
+
+use_partition() sizes max_concurrent_jobs to fill that cap and stop -- medium
+at 1 node is 32 cores/job, so 2 jobs, 64 of 80. Two things it cannot know:
+
+  - the cap counts YOUR jobs cluster-wide, so anything already running in
+    another queue eats into the same 80.
+  - wait_for_slot() throttles with `squeue -u <user> -p <partition>`, which
+    counts a single queue. Run this sweep on large while other jobs sit on
+    medium and the throttle will not see them.
 
 How to change them
 ------------------
@@ -112,12 +149,37 @@ How to change them
 
        s = Submitter("two_band", host=args.host, ...)
        s.job_name = args.name         # the same pattern, already in main()
-       s.nodes = 10                   # big grid: twice the usual nodes
-       s.max_concurrent_jobs = 4      # be polite while the cluster is busy
+       s.max_concurrent_jobs = 1      # be polite while the cluster is busy
 
    Only these seven are copied onto the Submitter. modules, env_exports,
    mpirun_flags and extra_sbatch are read from s.host directly and can only
    be changed in hpc_config.py.
+
+   Switching queues is the override most likely to be done wrong, so on hpc
+   it is one call rather than three assignments:
+
+       s.use_partition("large")           # 1 node,  2 x 20, 2 concurrent
+       s.use_partition("large", nodes=2)  # 2 nodes, 2 x 20, 1 concurrent
+
+   It sets partition, nodes, npn, cpt and max_concurrent_jobs together, from
+   the measured table in hpc_config.HPC_PARTITIONS, and prints what it chose.
+
+   Assigning s.partition by itself does NOT bring npn/cpt along: the seven
+   attributes are copied off the host profile exactly ONCE, in
+   Submitter.__init__, and nothing recomputes them afterwards. s.partition is
+   only the string written into #SBATCH --partition and the queue name
+   wait_for_slot() polls with `squeue -p`, so a bare reassignment sends the
+   job to large's 40-core nodes still carrying medium's 2 x 16 split.
+
+   Hand-tuning still wins, as long as it comes after:
+
+       s.use_partition("large")
+       s.max_concurrent_jobs = 1      # keep large's 2 x 20, queue one job
+
+   param has no partition table -- its queues have never been profiled the
+   way research_backup/setup/hpc_compute_*.md profiles hpc's -- so
+   use_partition() refuses there rather than applying another machine's
+   numbers. Set partition/npn/cpt by hand for param.
 
 Check before submitting
 -----------------------
@@ -231,13 +293,28 @@ def main():
                   dry_run=args.dry_run)
     s.job_name = args.name
 
-    # Per-sweep overrides -- uncomment to override the host profile for this
-    # sweep only (see the module docstring). Keep npn * cpt equal to the
-    # node's core count: param 48 (e.g. 4 x 12), hpc 32 (e.g. 4 x 8).
-    s.nodes = 1                 # param only -- hpc's 80-core cap allows 2
-    # s.npn = 4                   # MPI ranks per node
-    # s.cpt = 12                  # OMP threads per rank; param 4 * 12 = 48
-    # s.max_concurrent_jobs = 10  # how many jobs may sit in the queue at once
+    # ── Per-sweep overrides (see the module docstring) ────────────────────
+    # On hpc, ONE call picks the queue and the core layout that fits it:
+    #
+    #   s.use_partition("medium")          # 1 node, 2 x 16, 2 jobs  (default)
+    #   s.use_partition("large")           # 1 node, 2 x 20, 2 jobs
+    #   s.use_partition("large", nodes=2)  # 2 nodes, 2 x 20, 1 job
+    #   s.use_partition("test")            # cn17 smoke test, 8-core QoS cap
+    #
+    # It sets partition, nodes, npn, cpt and max_concurrent_jobs together:
+    # one MPI rank per NUMA domain, sized to fill the 80-core QoS cap without
+    # going over it. Never set s.partition on its own -- it does not carry
+    # npn/cpt with it, so the job lands on the new queue's nodes still split
+    # for the old queue's core count.
+    #
+    # The hpc profile already defaults to medium at 1 node, so use_partition
+    # is only needed to change queue or node count. Assignments placed AFTER
+    # it win, for anything you want to hand-tune:
+    # s.max_concurrent_jobs = 1   # how many jobs may sit in the queue at once
+    # s.npn, s.cpt = 4, 10        # only with a node layout you have verified
+
+    s.nodes = 1                   # your own override, kept: forces 1 node
+                                  # even on param, whose profile says 5
 
     points = list(sweep())
     print(f"host={s.host.name}  model=two_band  points={len(points)}", flush=True)

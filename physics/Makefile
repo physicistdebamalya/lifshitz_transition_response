@@ -11,7 +11,7 @@
 # ---------------------------------------------------------------- host ----
 # local : workstation                (~/cpp_libraries)
 # param : PARAM Ananta, cascadelake  (AVX-512)
-# hpc   : IITGN HPC2, rocky8         (-mtune=generic, needs cuda/libfabric)
+# hpc   : IITGN HPC2, rocky8         (skylake-avx512, needs cuda/libfabric)
 HOST ?= auto
 ifeq ($(HOST),auto)
   ifneq (,$(findstring /iitgn/homedirs,$(HOME)))
@@ -44,7 +44,24 @@ else ifeq ($(HOST),param)
   LDEXTRA :=
 else ifeq ($(HOST),hpc)
   LIBROOT   := /iitgn/homedirs/debamalya.dutta/cpp_libraries
-  ARCH      := -mtune=generic
+  # You compile on the login node and run on cn01-28, and they are NOT the
+  # same microarchitecture. login.iitgn.ac.in is a Xeon Gold 5215 -- Cascade
+  # Lake, advertises avx512_vnni. medium (cn06-16, Gold 6130) and large
+  # (cn18-28, Gold 6148) are Skylake-SP and have no VNNI. So -march=native
+  # here emits instructions that SIGILL on the nodes the jobs actually land
+  # on, which is why this line used to read -mtune=generic -- correct, but it
+  # meant baseline x86-64: no AVX, no AVX2, no FMA, on an Eigen RK4 kernel.
+  #
+  # skylake-avx512 is the common denominator: native on medium and large, and
+  # a strict subset of small's Cascade Lake (cn01-05, Gold 6230). Verified
+  # accepted by the cluster's gcc 12.3.0.
+  #
+  # Vector width is deliberately left at GCC's default (256) for this -march.
+  # 512-bit ops trigger AVX-512 license-based downclocking on Skylake-SP, and
+  # this solver's matrices are 2x2/4x4 -- far too small to earn the lost
+  # clock back. Do not copy param's -mprefer-vector-width=512 here; param is
+  # a different chip.
+  ARCH      := -march=skylake-avx512 -mtune=skylake-avx512
   CUDA_STUB := /iitgn/apps/packages/nvhpc/Linux_x86_64/25.3/cuda/12.8/targets/x86_64-linux/lib/stubs
   LIBFABRIC := /iitgn/apps/spack/opt/spack/linux-rocky8-cascadelake/gcc-12.3.0/libfabric-1.22.0-kjorf5ozailt7w3dgotagzdhf5zgpcvd/lib
   LDEXTRA   := -L$(CUDA_STUB) -L$(LIBFABRIC) -lcuda -lfabric

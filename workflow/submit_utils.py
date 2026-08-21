@@ -95,6 +95,65 @@ class Submitter:
 
         self._lockfile = None
 
+    # ----------------------------------------------------------- partition --
+    def use_partition(self, name, nodes=1):
+        """Switch queue and core layout together, from one name.
+
+        Setting self.partition alone is the mistake this exists to prevent:
+        the seven resource attributes are copied off the host profile once,
+        in __init__, and nothing recomputes them afterwards -- so a bare
+        `s.partition = "large"` sends the job to large's 40-core nodes still
+        carrying medium's 2 x 16 split, leaving 8 cores per node idle.
+
+            s.use_partition("large")           # 1 node, 2 x 20, 2 concurrent
+            s.use_partition("large", nodes=2)  # 2 nodes, 1 concurrent
+
+        Anything assigned AFTER this call wins, so a hand-tuned layout is
+        still one line away:
+
+            s.use_partition("large")
+            s.max_concurrent_jobs = 1          # be polite, keep the rest
+        """
+        if not self.host.partitions:
+            raise ValueError(
+                f"host {self.host.name!r} has no profiled partition table, so "
+                f"there is nothing to select from -- set partition/npn/cpt "
+                f"directly, or add a table for it in hpc_config.py. "
+                f"(Only 'hpc' has one: its queues differ in cores per node "
+                f"and in NUMA layout, which is what makes the lookup worth "
+                f"having.)")
+
+        plan = hpc_config.plan_partition(name, nodes=nodes,
+                                         partitions=self.host.partitions)
+        for k, v in plan.items():
+            setattr(self, k, v)
+
+        p = self.host.partitions[name]
+        used = plan["nodes"] * plan["npn"] * plan["cpt"]
+        print(f"partition={p.name}  {plan['nodes']} node(s) x {plan['npn']} "
+              f"rank(s) x {plan['cpt']} thread(s) = {used} cores/job, "
+              f"{plan['max_concurrent_jobs']} concurrent "
+              f"({used * plan['max_concurrent_jobs']}/{p.cpu_cap} core cap)  "
+              f"[{p.cpu}, walltime {p.walltime}]", flush=True)
+
+        # The cap can force a layout that no longer fills a node -- ask for 3
+        # medium nodes and 96 > 80, so cpt drops to 13 and 6 cores per node go
+        # unused. That is a legal job and it will run, but it is not what the
+        # "one rank per NUMA domain, fill the node" rule promises, so say so
+        # rather than let the printed numbers look tuned when they are not.
+        per_node = plan["npn"] * plan["cpt"]
+        if per_node != p.cores_per_node:
+            remedy = ("Fewer nodes would use each one fully."
+                      if p.cores_per_node <= p.cpu_cap else
+                      f"Inherent to this queue -- its {p.cpu_cap}-core QoS cap "
+                      f"is smaller than one {p.cores_per_node}-core node, so "
+                      f"no node count fills it. Use it for smoke tests only.")
+            print(f"  ⚠️  {per_node} of {p.cores_per_node} cores per node in "
+                  f"use: {plan['nodes']} x {p.cores_per_node} exceeds the "
+                  f"{p.cpu_cap}-core cap, so threads per rank were reduced to "
+                  f"fit. {remedy}", flush=True)
+        return self
+
     # ---------------------------------------------------------------- lock --
     def acquire_lock(self):
         lock = self.cwd / LOCKFILE
