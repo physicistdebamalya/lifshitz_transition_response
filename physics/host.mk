@@ -1,12 +1,15 @@
 # physics/host.mk -- per-host toolchain settings, defined ONCE.
 #
-# Included by physics/Makefile (which builds the shared engine object) and by
-# workflow/Makefile.job (which compiles one rewritten model per run dir).
-# Those two objects are linked into the same binary, so their flags must
-# agree. They used to be two hand-maintained copies, and they drifted: -march
-# was corrected in physics/Makefile while Makefile.job kept -mtune=generic,
-# so every per-job compile silently stayed scalar. One definition removes the
-# failure mode rather than documenting it.
+# Included by physics/Makefile, which is now the ONLY build path: since
+# parameters moved into task.csv (2026-08-22) a run directory holds a copy of
+# a prebuilt binary rather than a rewritten source to compile, so
+# workflow/Makefile.job is gone.
+#
+# It is kept as a separate file anyway, because the drift it was extracted to
+# stop was real: -march was once corrected in physics/Makefile while
+# Makefile.job kept -mtune=generic, and every per-job compile silently stayed
+# scalar for months. One definition, one includer, nothing to fall out of
+# step -- and a second includer, if one is ever added, starts out correct.
 #
 #   HOST=local|param|hpc, or leave it to autodetect from $HOME.
 
@@ -51,8 +54,27 @@ ifeq ($(HOST),local)
   MPIRUN  := $(MPI_LOCAL)/mpirun
 else ifeq ($(HOST),param)
   LIBROOT := /home/debamalya.dutta/cpp_libraries
-  ARCH    := -march=cascadelake -mtune=cascadelake -mprefer-vector-width=512 \
-             -mavx512f -mavx512dq -mavx512bw -mavx512vl
+  # Unlike hpc, login and compute here do NOT mismatch: verified 2026-08-21 by
+  # srun'ing lscpu onto real nodes of every CPU partition. login02/login03 and
+  # gpu001-010 are Xeon Gold 6248 (20 cores/socket); small/medium/large/
+  # highmemory (cn003-110, hm001-039) are Xeon Platinum 8268 (24 cores/socket).
+  # Different SKUs, but identical relevant flags on both:
+  #   avx avx2 avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni
+  # so one -march compiled on login runs on every queue without a SIGILL risk
+  # -- cascadelake names that shared feature set (and -march=native on login
+  # would emit the identical instruction set, since neither SKU has anything
+  # beyond it). GCC's cascadelake preset already turns on avx512cd/vl/vnni
+  # etc. itself, so listing the -mavx512* flags by hand after it was
+  # redundant and has been dropped.
+  #
+  # -mprefer-vector-width=256: GCC's own default for this target, and
+  # measured 2026-08-21 on param's own Platinum 8268 (medium and large, both
+  # queues, 113x113 grid): 256 beats 512 by 5.1-5.6%, matching the direction
+  # and rough size of hpc's Skylake-SP finding (~6%). No longer provisional
+  # -- see research_backup/setup/supercomputing_cluster/param/
+  # param_benchmark_flags.md. cascadelake itself (vs -mtune=generic, the
+  # unset default) is worth ~1.5x on this workload.
+  ARCH    := -march=cascadelake -mtune=cascadelake -mprefer-vector-width=256
   LDEXTRA :=
   MPIRUN  := mpirun
 else ifeq ($(HOST),hpc)

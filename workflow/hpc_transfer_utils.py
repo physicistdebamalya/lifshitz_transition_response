@@ -8,6 +8,13 @@ connection details come from: hpc_config.HostConfig already holds everything
 that differs between local/param/hpc, so hostname/port/user are read from
 there instead of a second, parallel host registry.
 
+check_remote_run_completion() / _warn_if_run_incomplete() are ported
+separately, from Superconductivity/python/hpc_transfer_utils.py -- a safety
+feature that project's transfer layer has and this one did not: before a
+download, verify (one extra command on the already-open session) that every
+SLURM job whose logs live under the remote source actually finished
+cleanly, and warn loudly, without blocking, if not.
+
 Not imported by workflow/submit_utils.py or the generators -- this only runs
 on the workstation, driving hpc_transfers.py. A cluster login node has no
 outbound reason to open an SFTP session to itself.
@@ -217,6 +224,21 @@ def run_remote(command: str) -> str:
     return out
 
 
+def run_remote_capture(command: str) -> tuple:
+    """Like run_remote, but returns (rc, stdout_text) instead of raising on a
+    nonzero exit -- for a diagnostic that has something useful to say either
+    way (job-status checks: "no matching jobs" and "sacct not on PATH" are
+    both a nonzero rc worth handling, not an exception worth aborting the
+    transfer over). Adapted from Superconductivity/python/hpc_transfer_utils.py.
+    """
+    if SSH_CLIENT is None:
+        raise RuntimeError("not connected -- call connect(host) first")
+    _stdin, stdout, _stderr = SSH_CLIENT.exec_command(command)
+    out = stdout.read().decode("utf-8", "ignore")
+    code = stdout.channel.recv_exit_status()
+    return code, out
+
+
 # ======================================================================================
 # transfer primitives
 # ======================================================================================
@@ -343,6 +365,111 @@ def download(src, dst, excludes=None) -> None:
 
 
 # ======================================================================================
+# pre-download safety check
+#
+# Adapted from Superconductivity/python/hpc_transfer_utils.py -- the one
+# safety feature that project's transfer layer has and this one did not:
+# verify, before pulling data back, that the SLURM jobs which produced it
+# actually finished cleanly.
+# ======================================================================================
+
+# SLURM job-ID-bearing filenames this project's own job scripts produce.
+# Since the array-job change (2026-08-22) each element redirects its own
+# output into its run directory as
+# mpi_logs_<arrayjobid>_<index>.out/.err (Submitter.array_script()), and
+# anything failing before that redirect lands in array_logs/%A_%a.out.
+# Not a general SLURM convention -- specific to how this project's job script
+# names them -- so this list is what ties the check to what is written.
+_JOB_LOG_GLOBS = ("mpi_logs_*.out", "mpi_logs_*.err")
+
+
+def check_remote_run_completion(remote_src: str):
+    """Every SLURM job ID whose log files live under `remote_src`
+    (recursively -- one mpi_logs_<id>.out/.err per dir_NNNNN, plus the
+    driver job's own log at the top level), and whether each finished
+    cleanly.
+
+    ONE extra command on the ALREADY-OPEN session (find | sacct, piped
+    remotely, not two round trips) -- consistent with this project's
+    one-session-many-commands rule (see research_backup/setup/
+    supercomputing_cluster/README.md), and cheap enough to run before every
+    download without it being a reason to skip it.
+
+    Returns (unclean, checked) where `unclean` is a list of (jobid, state,
+    elapsed) for every job NOT cleanly COMPLETED (RUNNING, PENDING, FAILED,
+    TIMEOUT, CANCELLED, OUT_OF_MEMORY, ... -- anything whose State does not
+    start with "COMPLETED", plus a COMPLETED job whose ExitCode was not 0:0,
+    which State alone would not catch) and `checked` is how many distinct
+    job IDs were actually found and looked up. checked==0 means nothing here
+    could be verified either way -- silence in `unclean` then means
+    "unknown", not "confirmed complete", and is reported as such by the
+    caller.
+    """
+    name_pattern = r"\( " + " -o ".join(f"-name '{g}'" for g in _JOB_LOG_GLOBS) + r" \)"
+    # Extract the job ID from the FILENAME'S OWN _<id>.out/.err suffix only,
+    # anchored to end of line -- never from the whole path. A bare
+    # `[0-9]+` over the full path would also match digits inside dir_NNNNN
+    # or the model name, neither of which is a job ID.
+    cmd = (
+        f"ids=$(find '{remote_src}' {name_pattern} 2>/dev/null "
+        f"| grep -oE '_[0-9]+\\.(out|err)$' | grep -oE '[0-9]+' | sort -un | paste -sd,); "
+        f"[ -n \"$ids\" ] && sacct -j \"$ids\" --noheader --parsable2 "
+        f"--format=JobID,State,Elapsed,ExitCode 2>/dev/null"
+    )
+    _rc, out = run_remote_capture(cmd)
+
+    checked_ids, unclean = set(), []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) != 4:
+            continue
+        jobid, state, elapsed, exitcode = parts
+        if "." in jobid:          # a step row (98578.batch, 98578.0), not a job itself
+            continue
+        checked_ids.add(jobid)
+        state_clean = state.strip().upper()
+        code = exitcode.split(":")[0].strip()
+        if not state_clean.startswith("COMPLETED") or code not in ("0", ""):
+            unclean.append((jobid, state.strip(), elapsed.strip()))
+    return unclean, len(checked_ids)
+
+
+def _warn_if_run_incomplete(host: str, remote_src: str) -> None:
+    """Printed loudly before a download, never blocking it: an incomplete
+    run's data.csv is still inspectable and sometimes legitimately worth
+    downloading on purpose. What must not happen is finding that out only
+    after archiving it, quietly, with no idea the source job never finished.
+    """
+    try:
+        unclean, checked = check_remote_run_completion(remote_src)
+    except Exception as e:
+        print(f"⚠️  could not verify remote job status before download ({e}). "
+              f"Proceeding without that check.", flush=True)
+        return
+
+    if checked == 0:
+        print(f"ℹ️  no SLURM job logs found under {host}:{remote_src} to verify "
+              f"completion against — proceeding without that check (not the "
+              f"same as confirmed complete).", flush=True)
+        return
+
+    if unclean:
+        print(f"\n{'!' * 78}", flush=True)
+        print(f"⚠️  WARNING: downloading from {host}:{remote_src}", flush=True)
+        print(f"    {len(unclean)} of {checked} job(s) found there did NOT "
+              f"complete cleanly — this run may be INCOMPLETE:", flush=True)
+        for jobid, state, elapsed in unclean:
+            print(f"      job {jobid}: {state}  (ran {elapsed})", flush=True)
+        print(f"    The data you are about to download may be partial. "
+              f"Proceeding anyway — check job state above before trusting "
+              f"the result.", flush=True)
+        print(f"{'!' * 78}\n", flush=True)
+    else:
+        print(f"✅  all {checked} job(s) found under {host}:{remote_src} "
+              f"completed cleanly.", flush=True)
+
+
+# ======================================================================================
 # driver
 # ======================================================================================
 
@@ -368,6 +495,7 @@ def run_transfers(host: str, transfers) -> None:
             if mode == "upload":
                 upload(src, dst, entry.get("excludes"))
             elif mode == "download":
+                _warn_if_run_incomplete(host, src)
                 download(src, dst, entry.get("excludes"))
             else:
                 print(f"invalid mode '{mode}'")

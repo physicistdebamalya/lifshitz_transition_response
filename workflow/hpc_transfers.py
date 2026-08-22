@@ -15,27 +15,27 @@
 # documents (see "Data locations" there), not two_component_BH's staging
 # layout.
 #
-# UPLOAD carries physics/{include,src,models}, physics/Makefile, workflow/*.py
-# + Makefile.job, and analysis/*.py (the generators import from analysis/, so
-# it has to exist wherever the generator runs) read-only onto the cluster.
+# UPLOAD carries physics/{include,src,models}, physics/Makefile + host.mk,
+# workflow/*.py and analysis/*.py (the generators import from analysis/, so it
+# has to exist wherever the generator runs) read-only onto the cluster.
 # It never writes into a local directory and never uploads physics/build/ --
 # a -march=native object built on the workstation must never be linked on a
 # cluster, which is exactly what physics/Makefile's per-host build/$(HOST)/
 # split already exists to prevent locally.
 #
 # DOWNLOAD pulls the remote project directory's run output -- every dir_NNNNN/
-# (data.csv, parameters.txt, job.sh, mpi_logs_*.out/err), directories.txt, and
-# incomplete_runs/ -- back into local staging at
+# (data.csv, parameters.txt, task.csv, mpi_logs_*.out/err), directories.txt,
+# and incomplete_runs/ -- back into local staging at
 # ~/temp_files_data/<model>_model/, which is exactly the directory shape
 # analysis/data_utils.sync_simulation_data() expects: directories.txt and
 # every dir_NNNNN it names, side by side, at the same level.
 #
-# ASSUMPTION, not yet exercised end to end: REMOTE_PROJECT_SUBDIR below is
-# where this repository is assumed to live under $HOME on each cluster,
-# mirroring physics/Makefile's own per-host layout. Nothing in this
-# repository records that path today (no sweep has been run on either
-# cluster through this pipeline yet) -- confirm or edit it before the first
-# real upload.
+# REMOTE_PROJECT_SUBDIR below is where this repository lives under $HOME on
+# each cluster, mirroring physics/Makefile's own per-host layout. Confirmed
+# in practice on both hosts (not only assumed): ~/projects/new/physics and
+# ~/projects/new/workflow exist and build correctly on param as of
+# 2026-08-21 (see research_backup/setup/supercomputing_cluster/param/), and
+# the same layout was exercised on hpc in the sessions before that.
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ PHYSICS_DIR = REPO_ROOT / "physics"
 WORKFLOW_DIR = REPO_ROOT / "workflow"
 ANALYSIS_DIR = REPO_ROOT / "analysis"
 
-# See the ASSUMPTION note above.
+# See the note above.
 REMOTE_PROJECT_SUBDIR = "projects/new"
 
 STAGING_ROOT = clean_path("/home/debamalya/temp_files_data")
@@ -67,13 +67,17 @@ UPLOAD_EXCLUDES = ["*.o", "*.pyc", "__pycache__", "build", "*.ipynb", ".ipynb_ch
 DOWNLOAD_EXCLUDES = [
     "*.o", "build", "physics", "workflow", "analysis",
     "__pycache__", "*.pyc", "Makefile", ".submit_lock",
+    # A build product, ~90-105 KB, now sitting in EVERY run directory because
+    # each gets its own copy of the binary. task.csv is deliberately NOT
+    # excluded: it is small, and it is the input-side provenance that the
+    # per-directory rewritten <model>.cpp used to be.
+    "exe_run",
 ]
 
 ANALYSIS_FILES = ["models.py", "snippets.py", "data_utils.py",
                   "loaders.py", "observables.py", "plotstyle.py"]
-WORKFLOW_FILES = ["hpc_config.py", "submit_utils.py",
-                  "generator_two_band.py", "generator_four_band.py",
-                  "Makefile.job"]
+WORKFLOW_FILES = ["hpc_config.py", "submit_utils.py", "task_schema.py",
+                  "generator_two_band.py", "generator_four_band.py"]
 
 
 def remote_root(host: str) -> str:
@@ -92,8 +96,8 @@ def staging_dir(model: str) -> Path:
 
 def transfers_up(host: str) -> list[dict]:
     """Everything the cluster needs to build and submit either model. Not
-    model-specific -- physics/models/*.cpp carries both, and change_lines()
-    picks which one a run rewrites; there is nothing to select at push time.
+    model-specific -- physics/models/*.cpp carries both models, and the
+    per-point task.csv selects which binary runs; nothing to select at push time.
     """
     destination = remote_root(host)
 
@@ -105,6 +109,11 @@ def transfers_up(host: str) -> list[dict]:
         {"mode": "upload", "src": PHYSICS_DIR / "models", "dst": f"{destination}/physics",
          "excludes": UPLOAD_EXCLUDES},
         {"mode": "upload", "src": PHYSICS_DIR / "Makefile", "dst": f"{destination}/physics/Makefile"},
+        # host.mk is NOT optional: physics/Makefile includes it unconditionally
+        # (line 16), so without it `make` fails immediately on a fresh cluster
+        # tree. It was missing from this list from the moment it was extracted
+        # -- the clusters only had it because it was copied there by hand.
+        {"mode": "upload", "src": PHYSICS_DIR / "host.mk", "dst": f"{destination}/physics/host.mk"},
     ]
 
     for name in WORKFLOW_FILES:
@@ -182,8 +191,13 @@ def main(argv=None) -> int:
         print(
             f"\nNext, on the {host} login node:\n"
             f"    cd {remote_root(host)}\n"
-            f"    make -C physics HOST={host}\n"
-            f"    python3 workflow/generator_two_band.py   # or generator_four_band.py"
+            f"    python3 workflow/generator_two_band.py   # or generator_four_band.py\n"
+            f"\n"
+            f"That is the whole command. It builds the model binary once on the\n"
+            f"login node, writes one task.csv per parameter point, submits the\n"
+            f"sweep as a SINGLE SLURM array job, and exits in seconds -- nothing\n"
+            f"is left running here, and SLURM does the throttling. Watch it with\n"
+            f"    squeue -u {T.base_path(host).name}"
         )
     return 0
 

@@ -95,10 +95,12 @@ class HostConfig:
 # right for one are wrong for the next. This table is what lets
 # Submitter.use_partition() set all of them from one name.
 #
-# IITGN HPC2 only. PARAM Ananta has no equivalent table -- nobody has
-# profiled its queues the way research_backup/setup/hpc_compute_*.md
-# profiles these, and inventing numbers for it would be worse than the
-# current situation, where param's single tuned layout lives in PARAM below.
+# Two tables: HPC_PARTITIONS for IITGN HPC2, PARAM_PARTITIONS for PARAM
+# Ananta (added 2026-08-21, see research_backup/setup/supercomputing_cluster/
+# param/). Both are measured the same way -- lscpu/numactl inside a real
+# allocation, not read off a datasheet -- and each HostConfig below points
+# at its own table, so plan_partition() never applies one cluster's numbers
+# to the other's hardware.
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,13 @@ class PartitionProfile:
 # pending with reason QOSMaxCpuPerUserLimit until earlier ones finish.
 FATQOS_CPU_CAP = 80
 
+# PARAM Ananta's equivalent: `scontrol show partition` gives every one of
+# small/medium/large/highmemory/gpu QoS=iitgn_qos (debug is the one
+# exception -- QoS=N/A, so it draws on nothing here). sacctmgr shows
+# iitgn_qos's MaxTRESPU as cpu=240,gres/gpu=2 -- again ONE shared budget
+# across all five, not 240 each. Verified live 2026-08-21.
+PARAM_QOS_CPU_CAP = 240
+
 HPC_PARTITIONS = {
     # 4 NUMA domains per node: sub-NUMA clustering is on here, unlike the
     # others, so this one wants 4 ranks x 10 threads rather than 2 x 20.
@@ -139,18 +148,57 @@ HPC_PARTITIONS = {
                                "5-00:00:00", 11, FATQOS_CPU_CAP),
     "large": PartitionProfile("large", 40, 2, "Xeon Gold 6148 @ 2.40GHz",
                               "10-00:00:00", 11, FATQOS_CPU_CAP),
-    # cn17 alone, 2 x 16 like medium. Its 8-core QoS cap makes it a smoke-test
-    # queue only: a whole node cannot be claimed here.
-    "test": PartitionProfile("test", 32, 2, "2 x 16 cores (model unprofiled)",
+    # cn17 alone, 2 x 16 like medium -- and IS medium's silicon: verified
+    # 2026-08-21 via srun+lscpu, Xeon Gold 6130 @ 2.10GHz, no VNNI. Its 8-core
+    # QoS cap makes it a smoke-test queue only: a whole node cannot be
+    # claimed here.
+    "test": PartitionProfile("test", 32, 2, "Xeon Gold 6130 @ 2.10GHz",
                              "5:00:00", 1, 8),
 }
 
 
-def plan_partition(name, nodes=1, partitions=None):
+# PARAM Ananta. Unlike hpc, every CPU partition here is a plain 2-socket
+# node with hyperthreading off -- no sub-NUMA clustering to worry about, so
+# npn = 2 (one rank per socket) and cpt = cores/socket everywhere. Sources:
+# research_backup/setup/supercomputing_cluster/param/param_login_1.md
+# (sinfo / scontrol / sacctmgr on login02) plus srun+lscpu on cn003 (small),
+# cn023 (medium), cn110 (large) and hm002 (highmemory) -- all four came back
+# Xeon Platinum 8268 @ 2.90GHz, 2x24 cores, identical down to the AVX-512
+# flag list. debug was not probed directly (it queues too fast to be worth
+# occupying) but `sinfo -N` reports the same 2:24:1 socket:core:thread
+# signature as the other four, so it is assumed to be the same hardware.
+# gpu is the one partition that differs (Xeon Gold 6248, 2x20 -- the same
+# model as the login nodes) and is intentionally left out of this table: it
+# needs a --gres=gpu request that plan_partition() has no field for, and
+# this solver has no GPU code path, so a CPU job there would just be
+# occupying a GPU node's cores for no benefit over a CPU-only queue.
+PARAM_PARTITIONS = {
+    # debug is the cluster default queue and carries no per-user QoS cap of
+    # its own (QoS=N/A on the partition) -- only its own 2-node, 96-core
+    # ceiling. cpu_cap is set to one node here as etiquette, not a real
+    # limit: it is meant for quick interactive checks shared by every user
+    # on the cluster, not for occupying both of its nodes at once.
+    "debug": PartitionProfile("debug", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
+                              "5:00:00", 2, 48),
+    "small": PartitionProfile("small", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
+                              "3-00:00:00", 18, PARAM_QOS_CPU_CAP),
+    "medium": PartitionProfile("medium", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
+                               "5-00:00:00", 40, PARAM_QOS_CPU_CAP),
+    "large": PartitionProfile("large", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
+                              "10-00:00:00", 50, PARAM_QOS_CPU_CAP),
+    "highmemory": PartitionProfile("highmemory", 48, 2,
+                                   "Xeon Platinum 8268 @ 2.90GHz",
+                                   "10-00:00:00", 39, PARAM_QOS_CPU_CAP),
+}
+
+
+def plan_partition(name, nodes=None, partitions=None):
     """queue name -> the #SBATCH numbers that use that queue best.
 
-    Two rules, both of them consequences of how the solver is parallelised
-    (physics/include/necessary_functions.h, ChargeCurrent):
+    Three rules, the first two consequences of how the solver is parallelised
+    (physics/include/necessary_functions.h, ChargeCurrent), the third of the
+    2026-08-23 resource-allocation policy: one parameter point should claim
+    as much of the cluster as it can, not share it with sibling jobs.
 
     1. One MPI rank per NUMA domain: npn = NUMA domains per node, cpt =
        cores per domain.
@@ -175,6 +223,22 @@ def plan_partition(name, nodes=1, partitions=None):
 
     2. Fill the QoS cap, do not exceed it. per_job * concurrent <= cpu_cap.
 
+    3. `nodes=None` (the default) means "as many WHOLE nodes as fit inside
+       the QoS cap" -- cpu_cap // cores_per_node, floored, never below one.
+       A single parameter point already saturates a whole node on its own
+       (necessary_functions.h block-decomposes one N1*N2 k-grid across every
+       MPI rank), so claiming several nodes for it is the same move scaled
+       up, not a change of kind -- and because one point is one job, there is
+       no sibling job whose slot this could be taking. The result: per_job
+       lands as close to the cap as whole-node granularity allows (exact,
+       when cores_per_node divides cpu_cap; short by the remainder
+       otherwise), and max_concurrent_jobs falls out at 1 whenever it does --
+       the array then runs its elements strictly one after another, each at
+       the maximum throughput this queue can give a single point. Pass an
+       explicit nodes= to ask for anything else; it is honoured exactly, even
+       when that leaves cores idle -- this function never overrides a value
+       it was actually given.
+
     Returns a plain dict of Submitter attributes, so the caller decides what
     to do with it -- apply it, print it, or override one field afterwards.
     """
@@ -182,10 +246,11 @@ def plan_partition(name, nodes=1, partitions=None):
     if name not in table:
         raise ValueError(
             f"unknown partition {name!r}; this host has "
-            f"{sorted(table)}. Add it to HPC_PARTITIONS in hpc_config.py, "
-            f"with cores_per_node and numa_per_node taken from an actual "
-            f"allocation (lscpu + numactl --hardware), not guessed.")
-    if nodes < 1:
+            f"{sorted(table)}. Add it to the matching *_PARTITIONS table in "
+            f"hpc_config.py (HPC_PARTITIONS for hpc, PARAM_PARTITIONS for "
+            f"param), with cores_per_node and numa_per_node taken from an "
+            f"actual allocation (lscpu + numactl --hardware), not guessed.")
+    if nodes is not None and nodes < 1:
         raise ValueError(f"nodes must be >= 1, got {nodes}")
 
     p = table[name]
@@ -207,7 +272,15 @@ def plan_partition(name, nodes=1, partitions=None):
               f"node layout and update HPC_PARTITIONS.", flush=True)
         cpt = max(1, live // npn)
 
-    # `test` is the only queue where a full node exceeds the cap (8 < 32).
+    if nodes is None:
+        # cores_per_node here is npn*cpt post-live-check, i.e. what a whole
+        # node of THIS queue actually costs right now.
+        nodes = max(1, p.cpu_cap // (npn * cpt))
+
+    # `test` is the only queue where a full node exceeds the cap (8 < 32) --
+    # this also catches the nodes=None case there, since the formula above
+    # gives nodes=1 (cpu_cap // cores_per_node floors to 0, clamped to 1) and
+    # a single node still overshoots.
     per_job = nodes * npn * cpt
     if per_job > p.cpu_cap:
         cpt = max(1, p.cpu_cap // (nodes * npn))
@@ -222,9 +295,37 @@ def plan_partition(name, nodes=1, partitions=None):
 
 PARAM = HostConfig(
     name="param",
-    modules=("gcc", "openmpi"),
-    nodes=5, npn=2, cpt=24,        # PARAM Ananta: 5 nodes x 48 cores
-    max_concurrent_jobs=25,
+    # Pinned, not bare "gcc"/"openmpi": module avail lists gcc/{7.5,9.2,
+    # 10.2,12.4} and openmpi/{4.1.4,4.1.8}, and the (D)efault marker on
+    # either can move under us. openmpi/4.1.8 already carries a UCX pml
+    # component (ompi_info --parsable), so no separate ucx module is needed
+    # here the way hpc needs one.
+    modules=("gcc/12.4", "openmpi/4.1.8"),
+    # These four ARE plan_partition("medium") -- see the HPC profile below
+    # for why that's asserted rather than just claimed, and
+    # workflow/tests/test_partition_plan.py for where it's checked. One rank
+    # per socket, 24 OpenMP threads per rank, on EVERY one of 5 nodes: a
+    # single parameter point now claims the full 240-core iitgn_qos cap by
+    # itself (2026-08-23 resource-allocation policy -- see plan_partition()'s
+    # rule 3). max_concurrent_jobs falls out at 1: with nothing left of the
+    # budget for a second element, the array runs its points strictly one
+    # after another, each at the maximum throughput medium can give it.
+    # 48 divides 240 exactly, so this is a full-budget fit with zero idle
+    # cores -- unlike hpc, no queue switch was needed to get there.
+    #
+    # Measured, not just derived from topology: every factorisation of 48
+    # (1x48 through 16x3) ties within 1% on both medium and large -- unlike
+    # hpc, param's OpenMPI does not even refuse the single-rank case. 2x24
+    # is kept anyway, for the same reason it is the default on hpc: "one
+    # rank per NUMA domain" is one rule for both clusters, a tie is not a
+    # reason to special-case one of them, and it is the choice that composes
+    # correctly across nodes (OpenMP cannot span nodes, so some non-trivial
+    # npn is unavoidable regardless). See param_benchmark_flags.md.
+    partition="medium",
+    nodes=5, npn=2, cpt=24,
+    max_concurrent_jobs=1,
+    partitions=PARAM_PARTITIONS,
+    cpu_budget=PARAM_QOS_CPU_CAP,
     hostname="paramananta.iitgn.ac.in", ssh_port=4422,
     remote_home="/home/debamalya.dutta",
 )
@@ -232,15 +333,24 @@ PARAM = HostConfig(
 HPC = HostConfig(
     name="hpc",
     modules=("gcc/12.3.0-gcc-12.3.0-b3lfzmk", "ucx/1.15.0", "cuda/12.8", "openmpi/5.0.8"),
-    # These four ARE plan_partition("medium", nodes=1) -- kept literal so the
-    # default costs no import-time computation, and asserted equal to it by
-    # workflow/tests/test_partition_plan.py. One node, one rank per socket,
-    # 16 OpenMP threads per rank; two such jobs = 64 of the 80-core cap.
-    # Change queue and layout together with s.use_partition("large") in the
+    # These four ARE plan_partition("large") -- kept literal so the default
+    # costs no import-time computation, and asserted equal to it by
+    # workflow/tests/test_partition_plan.py. Default queue is `large`, not
+    # `medium`: medium's 32 cores/node does not divide the shared 80-core
+    # fatqos cap evenly (2 nodes = 64/80, 16 idle; 3 nodes = 96, over the
+    # cap), while large's 40 cores/node does -- 2 nodes = 80/80 exactly. One
+    # rank per socket, 20 OpenMP threads per rank, on both nodes: a single
+    # parameter point claims the full cap by itself (2026-08-23
+    # resource-allocation policy -- see plan_partition()'s rule 3), so
+    # max_concurrent_jobs is 1 and the array runs its points strictly one
+    # after another. large also gives the longest walltime of the three
+    # (10 days vs medium's 5), useful headroom now that a point runs to
+    # completion alone rather than sharing a queue slot.
+    # Change queue and layout together with s.use_partition(...) in the
     # generator rather than editing npn/cpt here.
-    partition="medium",
-    nodes=1, npn=2, cpt=16,
-    max_concurrent_jobs=2,
+    partition="large",
+    nodes=2, npn=2, cpt=20,
+    max_concurrent_jobs=1,
     partitions=HPC_PARTITIONS,
     cpu_budget=FATQOS_CPU_CAP,
     env_exports=(

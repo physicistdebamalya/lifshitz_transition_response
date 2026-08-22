@@ -9,7 +9,7 @@
 # be linked into a cluster binary by accident.
 #
 # Every toolchain setting -- host detection, CXX, warnings, -march, library
-# roots -- comes from host.mk, which workflow/Makefile.job includes too.
+# roots -- comes from host.mk, the single definition of the toolchain.
 # Do not redefine any of them here; that duplication is what let the two
 # files drift apart before.
 

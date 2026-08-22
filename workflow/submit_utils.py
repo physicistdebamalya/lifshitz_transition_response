@@ -1,5 +1,7 @@
 """
-Job submission: build a run directory, compile into it, write job.sh, sbatch.
+Job submission: build a run directory, write its task.csv, copy in the
+binary built once by ensure_binary(), and sbatch the whole sweep as one
+SLURM array job (array_script() / submit_array()).
 
 Consolidates the four near-identical copies that lived in notebook cells, and
 adopts the two mechanisms Superconductivity added after the notebook version:
@@ -20,6 +22,7 @@ import atexit
 import itertools
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +39,7 @@ from data_utils import clean_path, parse_master_log          # noqa: E402
 from models import MODELS                                     # noqa: E402
 from snippets import (CreateSnippet, DEFAULT_IGNORE_PATTERNS,  # noqa: E402
                       find_key_by_substring)
+from task_schema import write_task_csv                        # noqa: E402
 import hpc_config                                             # noqa: E402
 
 COMPLETION_MARKER = "--- COMPLETING SIMULATION ---"
@@ -43,10 +47,21 @@ BACKUP_DIRNAME    = "incomplete_runs"
 DIRECTORIES_TXT   = "directories.txt"
 LOCKFILE          = ".submit_lock"
 MASTER_LOG        = "logfile.txt"
-# Set in the driver job's environment so the generator, on re-entry,
-# knows it is already on a compute node and should run the loop rather
-# than dispatch a second one. Mirrors AM5's LAUNCHED_BY_GENERATOR.
-DRIVER_ENV        = "NEW_SWEEP_DRIVER"
+
+# ── the array job's three bookkeeping files ───────────────────────────────
+# ARRAY_MAP    line N+1 is the run directory for SLURM_ARRAY_TASK_ID N. The
+#              array script reads it; nothing else depends on its format.
+# ARRAY_JOB_ID the id of the most recently submitted array. preparing_run()
+#              needs it because an array element's WorkDir is the SUBMIT
+#              directory, not its run directory, so the old per-directory
+#              squeue matching cannot see array elements at all.
+# ARRAY_LOG_DIR where SLURM writes each element's output BEFORE the script
+#              cds into its run directory -- so a failure that happens
+#              before the cd (a bad map file, a module load error) still
+#              leaves a trace somewhere findable.
+ARRAY_MAP         = "array_map.txt"
+ARRAY_JOB_ID      = ".array_job_id"
+ARRAY_LOG_DIR     = "array_logs"
 
 
 @lru_cache(maxsize=8)
@@ -66,11 +81,14 @@ def cpus_in_use(user):
     """Cores this user holds RUNNING, cluster-wide -- the unit and the scope
     the QoS ceiling actually enforces.
 
-    `fatqos` caps MaxTRESPU at cpu=80 across small+medium+large together, so a
-    throttle that counts jobs in one partition measures the wrong thing twice
-    over: wrong unit (a 64-core job and a 32-core job are not interchangeable)
-    and wrong scope (work queued on medium is invisible while submitting to
-    large). Adapted from Superconductivity/python/submit_utils_Phase.py.
+    `fatqos` caps MaxTRESPU at cpu=80 across small+medium+large together on
+    hpc; `iitgn_qos` caps it at cpu=240 across small+medium+large+highmemory
+    (+gpu) together on param. Both are the same shape of ceiling -- one pool,
+    several partitions -- so a throttle that counts jobs in one partition
+    measures the wrong thing twice over on either cluster: wrong unit (a
+    64-core job and a 32-core job are not interchangeable) and wrong scope
+    (work queued on medium is invisible while submitting to large). Adapted
+    from Superconductivity/python/submit_utils_Phase.py.
 
     PENDING jobs hold no TRES yet -- that is exactly why SLURM lets them queue
     rather than rejecting them -- so they are deliberately not counted.
@@ -129,7 +147,7 @@ class Submitter:
         self._warned_missing_logs = set()
 
     # ----------------------------------------------------------- partition --
-    def use_partition(self, name, nodes=1):
+    def use_partition(self, name, nodes=None):
         """Switch queue and core layout together, from one name.
 
         Setting self.partition alone is the mistake this exists to prevent:
@@ -138,23 +156,29 @@ class Submitter:
         `s.partition = "large"` sends the job to large's 40-core nodes still
         carrying medium's 2 x 16 split, leaving 8 cores per node idle.
 
-            s.use_partition("large")           # 1 node, 2 x 20, 2 concurrent
-            s.use_partition("large", nodes=2)  # 2 nodes, 1 concurrent
+        `nodes` defaults to None, which asks plan_partition() to fill the
+        chosen queue's QoS cap with as many WHOLE nodes as fit -- the
+        2026-08-23 policy that a single parameter point should claim as much
+        of the cluster as it can, since one point IS one job, with no
+        sibling job whose slot it could be taking:
+
+            s.use_partition("small")           # auto: 2 nodes, 2 x 20, 1 concurrent (80/80, hpc)
+            s.use_partition("large", nodes=1)  # explicit: 1 node, 2 x 20, 2 concurrent -- honoured exactly
 
         Anything assigned AFTER this call wins, so a hand-tuned layout is
         still one line away:
 
-            s.use_partition("large")
-            s.max_concurrent_jobs = 1          # be polite, keep the rest
+            s.use_partition("small")
+            s.max_concurrent_jobs = 2          # be polite, keep the rest
         """
         if not self.host.partitions:
             raise ValueError(
                 f"host {self.host.name!r} has no profiled partition table, so "
                 f"there is nothing to select from -- set partition/npn/cpt "
                 f"directly, or add a table for it in hpc_config.py. "
-                f"(Only 'hpc' has one: its queues differ in cores per node "
-                f"and in NUMA layout, which is what makes the lookup worth "
-                f"having.)")
+                f"('hpc' and 'param' both have one; 'local' does not, since "
+                f"it is not a queue -- there is nothing for a table to "
+                f"disambiguate.)")
 
         plan = hpc_config.plan_partition(name, nodes=nodes,
                                          partitions=self.host.partitions)
@@ -165,7 +189,7 @@ class Submitter:
         # read as authoritative and was not: anything assigned afterwards
         # (s.nodes = 1, say) changed the job without changing the line already
         # on screen. resource_summary() is printed once, later, from the
-        # values that actually reach job.sh.
+        # values that actually reach the array script (array_script()).
         return self
 
     def resource_summary(self):
@@ -290,28 +314,35 @@ class Submitter:
             self.iteration = start_index
             return start_index
 
-        active = get_active_job_info(self.slurm_user)
-        active_here = {}
-        if active is not None:
-            for workdir, (job_id, state) in active.items():
-                wp = Path(workdir)
-                if wp.name.startswith("dir_") and wp.parent.resolve() == self.cwd.resolve():
-                    active_here[wp.name] = (job_id, state)
+        # Is a previously submitted array still alive?
+        #
+        # This USED to walk squeue's %Z (WorkDir) and match dir_NNNNN entries
+        # one by one. That silently stops working with an array: every element
+        # reports the SUBMIT directory as its WorkDir, because the script cds
+        # into its run directory itself. The check would find nothing, report
+        # "none of these are running", and 'begin' would then delete
+        # directories out from under live jobs -- the exact accident it exists
+        # to prevent, made invisible.
+        #
+        # So ask about the array as a whole instead, which is both simpler and
+        # strictly more reliable: one job id, recorded at submit time.
+        live_elements = self._array_still_live()
 
-        if active_here:
-            details = "\n".join(f"  - {d}: job {j} is currently {s}"
-                                for d, (j, s) in active_here.items())
+        if live_elements:
             raise SystemExit(
-                f"{len(active_here)} run director"
-                f"{'y is' if len(active_here) == 1 else 'ies are'} still active:\n"
-                f"{details}\nNeither 'resume' nor 'begin' is safe now — resume would "
-                f"move a folder out from under a running job and begin would delete "
-                f"it. Wait (squeue -u {self.slurm_user}) and rerun.")
+                f"array job {self._recorded_array_id()} still has "
+                f"{len(live_elements)} element(s) queued or running "
+                f"({', '.join(live_elements[:6])}"
+                f"{', ...' if len(live_elements) > 6 else ''}).\n"
+                f"Neither 'resume' nor 'begin' is safe now — resume would move "
+                f"a folder out from under a running element and begin would "
+                f"delete it. Wait (squeue -u {self.slurm_user}) or scancel the "
+                f"array, then rerun.")
 
-        checked = ("checked against squeue: none of these are running"
-                   if active is not None else
-                   "could NOT reach squeue — verify none of these are still "
-                   "running before choosing 'begin'")
+        checked = ("checked against squeue: no element of the last array is "
+                   "still live" if live_elements is not None else
+                   "could NOT reach squeue — verify nothing is still running "
+                   "before choosing 'begin'")
         print(f"\n{len(lines) - start_index} incomplete run(s) ({checked}).", flush=True)
 
         # Inside a batch job there is no stdin: input() would block until the
@@ -412,66 +443,56 @@ class Submitter:
         with open(self.cwd / DIRECTORIES_TXT, "a") as f:
             f.write(f"{self.iteration}. {run_dir.name}\n")
 
-    def submit(self, p, model_source=None, repo=None):
-        """Realise one parameter point: rewrite, compile, submit.
+    def prepare(self, p, repo=None):
+        """Realise one parameter point as a run directory, ready to run.
 
-        Follows AM3_submit_utils.submit step for step:
-          dir_NNNNN -> change_lines into it -> Makefile -> compile
-                    -> job.sh -> sbatch -> directories.txt
+            dir_NNNNN -> task.csv -> exe_run -> directories.txt
 
-        A compile failure quarantines the directory and returns None rather
-        than aborting: one bad point in a 60-point sweep should not cost the
-        other 59.
+        NO COMPILE. The two model binaries are built ONCE, on the login node,
+        by ensure_binary(), before any of this. That is the whole point of the
+        task.csv mechanism: `module load gcc/12.4` inside a SLURM job on param
+        cannot find features.h (verified 2026-08-22 on cn001; the same test
+        succeeds on hpc's cn17), so a per-point compile is not something that
+        can be relocated -- it has to stop existing.
+
+        Returns the run directory, or None if the point could not be prepared.
+        A bad point is quarantined rather than aborting the sweep: one failure
+        in 207 should not cost the other 206.
         """
         repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
-        model_source = Path(model_source) if model_source else (
-            repo / "physics" / "models" / f"{self.model}.cpp")
-        if not model_source.exists():
-            raise FileNotFoundError(f"model source not found: {model_source}")
-
-        # Only a real submission needs the engine object present. A dry run on
-        # a laptop targeting `param` legitimately cannot have one.
-        if not self.dry_run:
-            self.ensure_engine(repo)
-
         validate_point(p)
 
         run_dir = self.new_run_dir()
-        target = run_dir / f"{self.model}.cpp"
-
         try:
-            change_lines(model_source, target, build_replacements(p, self.schema))
-        except ValueError:
+            write_task_csv(run_dir / "task.csv", p, self.schema)
+        except (KeyError, ValueError) as e:
             shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-
-        shutil.copy2(repo / "workflow" / "Makefile.job", run_dir / "Makefile")
+            self._quarantine_reason(run_dir.name, "task.csv could not be written", str(e))
+            return None
 
         if self.dry_run:
             print(f"  [dry-run] prepared {run_dir.name} "
-                  f"({self.model}.cpp rewritten, not compiled)", flush=True)
+                  f"(task.csv written, binary not copied)", flush=True)
+            self.iteration += 1
+            self.record_directory(run_dir)
             return run_dir
 
-        cmd = self._with_modules(
-            f"make MODEL={self.model} HOST={self.host.name} REPO={repo}")
+        binary = self.binary_path(repo)
+        if not binary.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise SystemExit(
+                f"model binary missing: {binary}\n"
+                f"ensure_binary() must run before the sweep loop -- the "
+                f"generator does this on the login node.")
 
-        try:
-            subprocess.run(cmd, shell=True, check=True, executable="/bin/bash",
-                           cwd=run_dir, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self._quarantine(run_dir, f"compile failed", e.stderr)
-            return None
+        # Copy, not symlink. ~90-105 KB per directory is nothing, and a
+        # symlink into physics/build/ breaks the moment that tree is rebuilt
+        # or moved mid-sweep -- while an archived run directory that carries
+        # its own binary stays self-contained and honest about what ran.
+        # copy2 preserves mtime, so `ls -l exe_run` is real provenance.
+        shutil.copy2(binary, run_dir / "exe_run")
 
         self.iteration += 1
-        (run_dir / "job.sh").write_text(self.job_script())
-
-        try:
-            subprocess.run(["sbatch", "job.sh"], cwd=run_dir, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            self._quarantine(run_dir, f"sbatch failed: {e}", "")
-            self.iteration -= 1
-            return None
-
         self.record_directory(run_dir)
         return run_dir
 
@@ -487,93 +508,207 @@ class Submitter:
             return cmd
         return f"{self.host.module_block().replace(chr(10), ' && ')} && {cmd}"
 
-    def ensure_engine(self, repo=None):
-        """Build physics/build/<host>/necessary_functions.o if it is absent.
-
-        This used to be a FileNotFoundError telling you to go run make. The
-        generator already knows the host, the modules and the repo, so there
-        was nothing for that message to obtain that it did not already have.
-        """
+    def binary_path(self, repo=None):
         repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
-        engine = repo / "physics" / "build" / self.host.name / "necessary_functions.o"
-        if engine.exists():
-            return engine
+        return repo / "physics" / "build" / self.host.name / self.model
 
-        print(f"building the engine object for host={self.host.name} "
-              f"(once; every run links it)", flush=True)
+    def ensure_binary(self, repo=None):
+        """Build physics/build/<host>/<model> on the LOGIN NODE.
+
+        REFUSES to run inside a SLURM job. Not defensive style -- verified
+        2026-08-22 by submitting real probe jobs: on hpc (cn17) compiling
+        inside a job works, on param (cn001) it fails with
+
+            fatal error: features.h: No such file or directory
+
+        because gcc/12.4's C++ headers cannot locate glibc's headers on a
+        compute node. This guard makes that unreachable rather than merely
+        documented, following two_component_BH's compile_drivers().
+
+        Runs `make` UNCONDITIONALLY rather than short-circuiting on
+        binary.exists(). make is idempotent and returns in under a second when
+        up to date, whereas an .exists() check is precisely how a binary built
+        before the last source edit gets copied into 207 run directories.
+        """
+        if "SLURM_JOB_ID" in os.environ:
+            raise SystemExit(
+                f"refusing to compile inside a SLURM job "
+                f"(SLURM_JOB_ID={os.environ['SLURM_JOB_ID']}). Model binaries "
+                f"are built on the login node -- the generator does this "
+                f"before it submits anything. On param a compile inside a job "
+                f"fails outright (features.h is not reachable from a compute "
+                f"node); on hpc it would work but still burns allocation on "
+                f"work the login node does for free.")
+
+        repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
+        binary = self.binary_path(repo)
+
+        print(f"building {self.model} for host={self.host.name} ...", flush=True)
         cmd = self._with_modules(
             f"make -C {repo/'physics'} HOST={self.host.name} "
-            f"build/{self.host.name}/necessary_functions.o")
+            f"build/{self.host.name}/{self.model}")
         r = subprocess.run(cmd, shell=True, executable="/bin/bash",
                            capture_output=True, text=True)
-        if r.returncode != 0 or not engine.exists():
+        if r.returncode != 0 or not binary.exists():
             tail = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
-            raise SystemExit(f"engine build failed:\n{tail}")
-        print(f"  -> {engine}", flush=True)
-        return engine
+            raise SystemExit(f"build failed:\n{tail}")
+        print(f"  -> {binary}", flush=True)
+        return binary
 
-    def should_dispatch(self):
-        """True when the sweep loop ought to move to a compute node."""
-        return (self.host.name != "local"
-                and not self.dry_run
-                and os.environ.get(DRIVER_ENV) != "1")
+    def max_array_size(self):
+        """SLURM's MaxArraySize, read live. 1001 on both clusters as of
+        2026-08-22, but a sweep is refused against the live value rather than
+        a remembered one."""
+        try:
+            out = subprocess.run(["scontrol", "show", "config"],
+                                 capture_output=True, text=True, check=True,
+                                 timeout=20).stdout
+            return int(re.search(r"MaxArraySize\s*=\s*(\d+)", out).group(1))
+        except Exception:
+            return None
 
-    def dispatch_to_compute_node(self, generator, argv=(), walltime=None):
-        """Run the submission loop itself as a batch job, as generator_AM5.py
-        does.
+    def array_script(self, count, walltime=None, exe="./exe_run",
+                     task_file="task.csv"):
+        """The one job script an entire sweep runs under.
 
-        The loop is not bookkeeping: for every one of 200+ points it rewrites
-        the model source and invokes g++ on an Eigen translation unit. Doing
-        that on the login node is hours of compilation on a machine shared by
-        everyone on the cluster. The engine object is built here first (once,
-        cheap) and the per-point compiles happen inside the job.
+        Every element is the SAME binary on the SAME resources, differing only
+        in which directory it enters -- which is exactly what an array is for,
+        and exactly what became possible once parameters stopped being
+        compiled in.
 
-        One core is the right size: the compiles are sequential and each is
-        single-threaded, so more would sit idle while still counting against
-        the QoS ceiling.
+        Two details that are not cosmetic:
+
+        1. THE LOG REDIRECT. #SBATCH --output is resolved relative to the
+           submit directory, and an array is submitted once from the parent,
+           so %j would drop every element's log in the parent rather than in
+           its run directory. Redirecting after the cd puts them back where
+           is_job_complete() looks for them (mpi_logs_*.out) and where the
+           archive expects them.
+        2. `set -e` BEFORE the cd. Without it a failed cd runs the solver in
+           the submit directory, overwriting the parent's files and reporting
+           success -- the same shape as the venv bug in
+           hpc_job_failure_modes.md, where a failed `source` did not stop the
+           script and the run silently used the wrong Python.
         """
-        generator = Path(generator).resolve()
         p = (self.host.partitions or {}).get(self.partition)
         walltime = walltime or (p.walltime if p else "1-00:00:00")
 
-        script = self.cwd / f"driver_{self.model}.sh"
         lines = ["#!/bin/bash",
-                 f"#SBATCH --job-name={self.job_name}_driver",
+                 f"#SBATCH --job-name={self.job_name}",
                  f"#SBATCH --partition={self.partition}",
                  f"#SBATCH --qos={self.qos}",
-                 "#SBATCH --nodes=1",
-                 "#SBATCH --ntasks-per-node=1",
-                 "#SBATCH --cpus-per-task=1",
+                 f"#SBATCH --nodes={self.nodes}",
+                 f"#SBATCH --ntasks-per-node={self.npn}",
+                 f"#SBATCH --cpus-per-task={self.cpt}",
+                 "#SBATCH --hint=nomultithread",
                  f"#SBATCH --time={walltime}",
-                 f"#SBATCH --output=driver_{self.model}_%j.out",
-                 f"#SBATCH --error=driver_{self.model}_%j.err",
+                 # %N throttling: SLURM itself runs at most this many elements
+                 # at once. This replaces the old Python wait_for_slot() poll
+                 # loop, and with it the only reason the submitting process had
+                 # to stay alive at all.
+                 f"#SBATCH --array=0-{count - 1}%{self.max_concurrent_jobs}",
+                 f"#SBATCH --output={ARRAY_LOG_DIR}/%A_%a.out",
+                 f"#SBATCH --error={ARRAY_LOG_DIR}/%A_%a.err",
                  *self.host.extra_sbatch,
+                 "",
+                 "set -e",
                  ""]
+
         if self.host.modules:
             lines += [self.host.module_block(), ""]
-        lines += ["cd $SLURM_SUBMIT_DIR", ""]
 
-        # Carry whatever Python is running this over into the job. Without it
-        # the driver gets the system python3, which has neither numpy nor this
-        # project's imports.
-        venv = Path(sys.prefix)
-        if sys.prefix != sys.base_prefix and (venv / "bin" / "activate").exists():
-            lines += [f"source {venv / 'bin' / 'activate'}", ""]
-
-        lines += [f"export {DRIVER_ENV}=1",
+        lines += [f'RUN_DIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" '
+                  f'"$SLURM_SUBMIT_DIR/{ARRAY_MAP}")',
+                  'if [ -z "$RUN_DIR" ]; then',
+                  '    echo "no run directory for array index $SLURM_ARRAY_TASK_ID" >&2',
+                  "    exit 1",
+                  "fi",
+                  'cd "$SLURM_SUBMIT_DIR/$RUN_DIR"',
                   "",
-                  " ".join(["python3", str(generator), *map(str, argv)]),
+                  "# From here on, everything belongs to this run directory.",
+                  'exec > "mpi_logs_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out" \\',
+                  '     2> "mpi_logs_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.err"',
                   ""]
-        script.write_text("\n".join(lines))
+
+        if self.host.env_exports:
+            lines += [*self.host.env_exports, ""]
+
+        lines += ["export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK",
+                  "export OMP_PROC_BIND=spread",
+                  "export OMP_PLACES=cores",
+                  "",
+                  "# Provenance: which binary and which input actually ran.",
+                  f"ls -l --time-style=full-iso {exe} {task_file}",
+                  "",
+                  f"mpirun {self.host.mpirun_flags} \\",
+                  "    --map-by ppr:${SLURM_NTASKS_PER_NODE}:node:PE=${SLURM_CPUS_PER_TASK} \\",
+                  f"    --bind-to core {exe} {task_file}",
+                  "",
+                  "date",
+                  ""]
+        return "\n".join(lines)
+
+    def submit_array(self, run_dirs, walltime=None):
+        """Submit a whole sweep as ONE array job, and return.
+
+        Replaces both the login-node submission loop and the compute-node
+        driver job. Neither was right:
+
+          - a loop on the login node contradicts stated policy. IITGN HPC's
+            /etc/motd: "Running any kind of simulation & jobs are NOT allowed
+            in the login node; JOBS must run through a scheduler only." No
+            enforcement daemon was found on either cluster in 2026-08, but the
+            policy is written down and this code outlives that snapshot.
+          - a driver job holds a core for the sweep's whole lifetime, and this
+            solver is sized to fill its allocation exactly (npn x cpt = one
+            node), so a stray core is not free.
+
+        An array costs neither: nothing long-lived runs anywhere, SLURM does
+        the throttling, and the whole sweep is one squeue line rather than N.
+        """
+        if not run_dirs:
+            print("nothing to submit.", flush=True)
+            return None
+
+        limit = self.max_array_size()
+        if limit is not None and len(run_dirs) > limit:
+            raise SystemExit(
+                f"{len(run_dirs)} points exceeds this cluster's MaxArraySize "
+                f"of {limit}. Split the sweep, or raise it with the admins.")
+
+        (self.cwd / ARRAY_LOG_DIR).mkdir(exist_ok=True)
+        # The index -> directory map the array script reads. Line N+1 is the
+        # directory for SLURM_ARRAY_TASK_ID N.
+        (self.cwd / ARRAY_MAP).write_text(
+            "\n".join(d.name for d in run_dirs) + "\n")
+
+        script = self.cwd / f"sweep_{self.model}.sh"
+        script.write_text(self.array_script(len(run_dirs), walltime))
+
+        if self.dry_run:
+            print(f"  [dry-run] would submit {len(run_dirs)} point(s) as an "
+                  f"array, {self.max_concurrent_jobs} at a time", flush=True)
+            return None
 
         r = subprocess.run(["sbatch", script.name], cwd=self.cwd,
                            capture_output=True, text=True)
         if r.returncode != 0:
-            raise SystemExit(f"could not submit the driver job:\n{r.stderr.strip()}")
+            raise SystemExit(f"could not submit the array job:\n{r.stderr.strip()}")
+
         print(r.stdout.strip(), flush=True)
-        print(f"the sweep now runs on a compute node; watch it with\n"
-              f"  tail -f {self.cwd}/driver_{self.model}_<jobid>.out", flush=True)
-        return r.stdout.strip()
+        job_id = re.search(r"(\d+)", r.stdout)
+        job_id = job_id.group(1) if job_id else ""
+        # preparing_run() needs this on a later invocation: an array element
+        # reports the SUBMIT directory as its WorkDir, not its run directory,
+        # so directories can no longer be matched to live jobs one by one.
+        (self.cwd / ARRAY_JOB_ID).write_text(job_id + "\n")
+
+        print(f"{len(run_dirs)} point(s) queued as array {job_id}, "
+              f"{self.max_concurrent_jobs} running at a time.\n"
+              f"  squeue -u {self.slurm_user}\n"
+              f"  logs: {self.cwd}/{ARRAY_LOG_DIR}/ (pre-cd) and each "
+              f"dir_NNNNN/mpi_logs_*.out (the run itself)", flush=True)
+        return job_id
 
     def _quarantine(self, run_dir, why, detail=""):
         """Move a failed run dir aside so it can be inspected, without letting
@@ -594,36 +729,57 @@ class Submitter:
             tail = "\n".join(detail.strip().splitlines()[-8:])
             print(f"      {tail}", flush=True)
 
+    def _recorded_array_id(self):
+        """The last array job id submitted from this directory, or None."""
+        path = self.cwd / ARRAY_JOB_ID
+        if not path.exists():
+            return None
+        return path.read_text().strip() or None
+
+    def _array_still_live(self):
+        """Element ids of the last submitted array that are still queued or
+        running.
+
+        Returns [] when the array is finished or there was never one, and
+        None when squeue could not be reached -- the caller must treat None
+        as "unknown", never as "nothing is running".
+        """
+        job_id = self._recorded_array_id()
+        if job_id is None:
+            return []
+        try:
+            out = subprocess.run(
+                ["squeue", "-j", job_id, "-h", "-o", "%i %T"],
+                capture_output=True, text=True, timeout=30)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            # squeue exits nonzero for a job id it no longer knows about,
+            # which is the normal state once an array has drained.
+            return []
+        return [line.split()[0] for line in out.stdout.splitlines() if line.strip()]
+
+    def _quarantine_reason(self, name, why, detail=""):
+        """Report a point that never got as far as having a directory to move."""
+        print(f"  ⚠️  {why} for {name}", flush=True)
+        if detail:
+            tail = "\n".join(detail.strip().splitlines()[-8:])
+            print(f"      {tail}", flush=True)
+
     def cores_per_job(self):
         return self.nodes * self.npn * self.cpt
 
-    def wait_for_slot(self, poll=120):
-        """Block until this job's cores fit under the QoS ceiling.
-
-        Two limits, and they mean different things. The cluster-wide core
-        budget is what SLURM enforces: exceed it and jobs sit pending on
-        QOSMaxCpuPerUserLimit, which is not an error but does mean the
-        submission loop races ahead of what can actually start.
-        max_concurrent_jobs is the politeness knob on top of that -- how much
-        of the budget this one sweep is willing to occupy.
-        """
-        need = self.cores_per_job()
-        budget = min(self.cpu_budget, self.max_concurrent_jobs * need)
-        warned = False
-        while True:
-            used = cpus_in_use(self.slurm_user)
-            if used is None:
-                if not warned:
-                    print("⚠️  squeue unreachable — cannot throttle; submitting "
-                          "without a core check", flush=True)
-                return
-            if used + need <= budget:
-                return
-            if not warned:
-                print(f"⏳ {used} core(s) running, this job needs {need}, "
-                      f"budget {budget} — waiting", flush=True)
-                warned = True
-            time.sleep(poll)
+    # NOTE: wait_for_slot() is gone, and so is the process that had to stay
+    # alive to run it. Throttling is now `#SBATCH --array=0-N%K` in
+    # array_script(), enforced by SLURM.
+    #
+    # K is the same number the poll loop used as its ceiling:
+    # max_concurrent_jobs, which plan_partition() derives as
+    # cpu_budget // cores_per_job (param medium 240/48 = 5; hpc medium
+    # 80/32 = 2). The QoS core cap remains underneath as a backstop -- if
+    # other jobs of yours are already running, array elements simply pend on
+    # QOSMaxCpuPerUserLimit, which is SLURM enforcing the same budget the
+    # loop used to poll for, without anything of ours having to be running.
 
 
 # ---------------------------------------------------------------- validation --

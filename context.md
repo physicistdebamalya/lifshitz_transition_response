@@ -113,17 +113,39 @@ precision. All 61 two_band runs are clean.
   in `ChargeCurrent()` sums in thread-arrival order, giving ~1e-14 relative
   spread between identical runs. Fixable with per-thread slots summed in a
   fixed order; not done, as the engine was out of scope for this pass.
-### Source rewriting, not task.csv
+### task.csv, after all — and why the original reasoning was wrong (2026-08-22)
 
 Superconductivity's AM5 generation moved from rewriting source to a runtime
 schema-validated `task.csv`, and adopting that here was the initial proposal.
-It was rejected: this project's unit is one run = one parameter point = one
-time series, so a task file would carry exactly one row, and the recompile it
-would save is a link against a prebuilt engine object rather than a full
-rebuild. The cost it removes is small; the indirection it adds is not.
+**It was rejected, and that decision has now been reversed.** The original
+argument is preserved here because the way it failed is the useful part:
 
-Source rewriting stays, with the strict `change_lines()` from
-`AM3_submit_utils` that raises on an unmatched prefix rather than silently
-leaving the old value. `build_replacements()` derives the substitutions from
-the schema, which is what the notebook version lacked -- it listed all thirty
-by hand, in each of four copies.
+> this project's unit is one run = one parameter point = one time series, so a
+> task file would carry exactly one row, and the recompile it would save is a
+> link against a prebuilt engine object rather than a full rebuild. The cost
+> it removes is small; the indirection it adds is not.
+
+Every sentence of that is true **on hpc**. It is false on param, and the
+difference is not one of degree: `module load gcc/12.4` inside a SLURM job on
+param cannot find `features.h`, so a per-point compile there does not cost a
+little more — it does not work at all (verified 2026-08-22 by submitting probe
+jobs to both clusters; hpc's cn17 compiled cleanly, param's cn001 did not).
+The decision was made by weighing a cost, when the real question was whether
+the operation was available. One cluster was never tested.
+
+Two things followed that the cost argument could not have predicted:
+
+- **A per-point compile is not relocatable, so it had to stop existing.** The
+  binary is built once on the login node and copied into each run directory.
+- **Every point then shares one binary, which is what an array job requires.**
+  A whole sweep is now a single `sbatch --array=0-N%K`, which removed the
+  submission loop entirely — and with it the question of where that loop
+  should run, which had no good answer (a login-node loop contradicts IITGN
+  HPC's stated policy; a driver job holds a core for days from an allocation
+  this solver is sized to fill exactly).
+
+`change_lines()` / `build_replacements()` are retired. The discipline they
+carried is not: `write_task_csv()` raises naming every missing column,
+`require_known_columns()` in C++ makes an unrecognised header a hard error
+rather than an ignored one, and `TaskSpec` has no member defaults, so there
+is nothing for a missed column to quietly fall back to.

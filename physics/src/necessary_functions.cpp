@@ -1,7 +1,220 @@
 // necessary_functions.cpp
 
 #include <iomanip>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
 #include "necessary_functions.h"
+
+// ═══════════════════════════════════════════════════════ task.csv reading ══
+// See the header for why this exists and why every column is required.
+
+PulseKind pulse_kind_from_string(const std::string &text)
+{
+    // Kept in one-to-one correspondence with operator<<(std::ostream&,
+    // PulseKind) by construction: these are its output spellings, and the
+    // writer puts exactly those in the cell, so a task.csv value and a
+    // parameters.txt line read the same and no translation table is needed.
+    if (text == "NA")
+        return PulseKind::NA;
+    if (text == "Envelope")
+        return PulseKind::Envelope;
+    if (text == "Gaussian")
+        return PulseKind::Gaussian;
+    if (text == "sin^2")
+        return PulseKind::Sin2;
+    if (text == "Linear")
+        return PulseKind::Linear;
+    if (text == "sin")
+        return PulseKind::Sin;
+    if (text == "cos")
+        return PulseKind::Cos;
+
+    throw std::runtime_error(
+        "'" + text + "' is not a pulse kind. Valid spellings are exactly what "
+        "operator<< prints: NA, Envelope, Gaussian, sin^2, Linear, sin, cos.");
+}
+
+std::string trim_cell(const std::string &text)
+{
+    const auto is_space = [](unsigned char c)
+    { return std::isspace(c) != 0; };
+
+    auto begin = std::find_if_not(text.begin(), text.end(), is_space);
+    auto end = std::find_if_not(text.rbegin(), text.rend(), is_space).base();
+    return (begin < end) ? std::string(begin, end) : std::string();
+}
+
+std::vector<std::string> split_csv(const std::string &line)
+{
+    std::vector<std::string> cells;
+    std::string cell;
+    std::istringstream stream(line);
+    while (std::getline(stream, cell, ','))
+        cells.push_back(trim_cell(cell));
+    return cells;
+}
+
+static std::string join(const std::vector<std::string> &items)
+{
+    std::string out;
+    for (size_t i = 0; i < items.size(); ++i)
+        out += (i ? ", " : "") + items[i];
+    return out;
+}
+
+void require_known_columns(const std::string &path,
+                           const std::vector<std::string> &header,
+                           const std::vector<std::string> &known)
+{
+    std::vector<std::string> unknown;
+    for (const auto &column : header)
+        if (std::find(known.begin(), known.end(), column) == known.end())
+            unknown.push_back(column);
+
+    if (!unknown.empty())
+        throw std::runtime_error(
+            path + ": column(s) [" + join(unknown) + "] are not read by this "
+            "binary. An unread column is silently ignored, so the parameter it "
+            "was meant to set would keep an unchosen value and the run would "
+            "look fine. Columns this binary reads: [" + join(known) + "].");
+}
+
+void require_columns(const std::string &path,
+                     const std::vector<std::string> &header,
+                     const std::vector<std::string> &required)
+{
+    std::vector<std::string> missing;
+    for (const auto &column : required)
+        if (std::find(header.begin(), header.end(), column) == header.end())
+            missing.push_back(column);
+
+    if (!missing.empty())
+        throw std::runtime_error(
+            path + ": missing required column(s) [" + join(missing) + "]. "
+            "Every column is required -- this file is always machine-written, "
+            "so a missing one is a bug, and there are deliberately no defaults "
+            "to fall back on.");
+}
+
+TaskRow::TaskRow(std::string path, std::vector<std::string> header,
+                 std::vector<std::string> cells)
+    : path_(std::move(path)), header_(std::move(header)), cells_(std::move(cells))
+{
+    if (header_.size() != cells_.size())
+        throw std::runtime_error(
+            path_ + ": the header has " + std::to_string(header_.size()) +
+            " column(s) but the data row has " + std::to_string(cells_.size()) +
+            ". A cell most likely contains a comma; this format has no quoting.");
+}
+
+const std::string &TaskRow::cell(const std::string &key) const
+{
+    for (size_t i = 0; i < header_.size(); ++i)
+        if (header_[i] == key)
+            return cells_[i];
+    throw std::runtime_error(path_ + ": no column '" + key + "'");
+}
+
+double TaskRow::dbl(const std::string &key) const
+{
+    const std::string &value = cell(key);
+    size_t consumed = 0;
+    double out = 0.0;
+    try
+    {
+        out = std::stod(value, &consumed);
+    }
+    catch (const std::exception &)
+    {
+        throw std::runtime_error(path_ + ": column '" + key + "' = '" + value +
+                                 "' is not a number");
+    }
+    if (consumed != value.size())
+        throw std::runtime_error(
+            path_ + ": column '" + key + "' = '" + value + "' has trailing "
+            "characters after the number; refusing to use the prefix.");
+    return out;
+}
+
+int TaskRow::integer(const std::string &key) const
+{
+    const std::string &value = cell(key);
+    size_t consumed = 0;
+    int out = 0;
+    try
+    {
+        out = std::stoi(value, &consumed);
+    }
+    catch (const std::exception &)
+    {
+        throw std::runtime_error(path_ + ": column '" + key + "' = '" + value +
+                                 "' is not an integer");
+    }
+    if (consumed != value.size())
+        // std::stoi("10.5") returns 10 and stops at the '.', silently. That
+        // is a different parameter point from the one that was requested.
+        throw std::runtime_error(
+            path_ + ": column '" + key + "' = '" + value + "' is not a whole "
+            "number; refusing to truncate it.");
+    return out;
+}
+
+std::string TaskRow::text(const std::string &key) const { return cell(key); }
+
+PulseKind TaskRow::kind(const std::string &key) const
+{
+    try
+    {
+        return pulse_kind_from_string(cell(key));
+    }
+    catch (const std::exception &e)
+    {
+        throw std::runtime_error(path_ + ": column '" + key + "': " + e.what());
+    }
+}
+
+TaskRow read_single_task_row(const std::string &path,
+                             const std::vector<std::string> &known)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+        throw std::runtime_error("cannot open task file '" + path + "'");
+
+    std::vector<std::string> header;
+    std::vector<std::vector<std::string>> rows;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        const std::string trimmed = trim_cell(line);
+        if (trimmed.empty() || trimmed[0] == '#')
+            continue;
+        if (header.empty())
+            header = split_csv(trimmed);
+        else
+            rows.push_back(split_csv(trimmed));
+    }
+
+    if (header.empty())
+        throw std::runtime_error(path + ": file is empty (no header row)");
+
+    require_known_columns(path, header, known);
+    require_columns(path, header, known);
+
+    if (rows.size() != 1)
+        throw std::runtime_error(
+            path + ": found " + std::to_string(rows.size()) + " data row(s), "
+            "expected exactly 1. In this project ONE parameter point expands "
+            "into an N1*N2 k-grid that ALL MPI ranks and ALL OpenMP threads "
+            "cooperate on -- the k-list is block-decomposed across ranks and "
+            "reduced once at the end (see ChargeCurrent). A row is therefore a "
+            "whole job, not a unit of work to pack alongside others. For N "
+            "points, write N run directories.");
+
+    return TaskRow(path, header, rows.front());
+}
 
 namespace Pauli
 {

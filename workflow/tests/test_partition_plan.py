@@ -5,12 +5,15 @@
 
 The numbers in HPC_PARTITIONS came from real allocations (lscpu + numactl
 --hardware on cn03/cn15/cn21, recorded in research_backup/setup/
-hpc_compute_*.md) and from sinfo / sacctmgr on login.iitgn.ac.in. Nothing
-here can re-measure the cluster, so what it does check is that the arithmetic
-built on those numbers stays self-consistent: that every layout fills exactly
-one node, that no plan exceeds its QoS cap, and -- the one that would
-actually bite -- that the literal defaults in the HPC profile still equal
-what plan_partition() computes for them.
+hpc_compute_*.md) and from sinfo / sacctmgr on login.iitgn.ac.in. The numbers
+in PARAM_PARTITIONS came the same way -- lscpu on cn003/cn023/cn110/hm002,
+recorded in research_backup/setup/supercomputing_cluster/param/ -- and from
+sinfo / sacctmgr on login02/login03.paramananta.iitgn.ac.in. Nothing here can
+re-measure either cluster, so what it does check is that the arithmetic built
+on those numbers stays self-consistent: that every layout fills exactly one
+node, that no plan exceeds its QoS cap, and -- the one that would actually
+bite -- that the literal defaults in each HostConfig still equal what
+plan_partition() computes for them.
 """
 
 import sys
@@ -31,52 +34,86 @@ def check(label, got, want):
         failures.append(label)
 
 
-print("npn * cpt fills exactly one node (no idle cores, no oversubscription)")
-for name, p in hpc_config.HPC_PARTITIONS.items():
-    if p.cores_per_node > p.cpu_cap:
-        continue                    # test: the cap, not the node, is the limit
-    plan = hpc_config.plan_partition(name)
-    check(f"{name}: {plan['npn']} x {plan['cpt']} == {p.cores_per_node} cores",
-          plan["npn"] * plan["cpt"], p.cores_per_node)
+# Both profiled clusters get the same checks. Looping over this instead of
+# writing HPC_PARTITIONS and PARAM_PARTITIONS out twice is what keeps them
+# from drifting the way the two npn/cpt comment blocks did before.
+CLUSTERS = {
+    "hpc": hpc_config.HPC_PARTITIONS,
+    "param": hpc_config.PARAM_PARTITIONS,
+}
 
-print("\none MPI rank per NUMA domain")
-for name, p in hpc_config.HPC_PARTITIONS.items():
-    check(f"{name}: npn == {p.numa_per_node} NUMA domains",
-          hpc_config.plan_partition(name)["npn"], p.numa_per_node)
+for cluster, table in CLUSTERS.items():
+    print(f"\n=== {cluster} ===")
 
-print("\nno plan exceeds its QoS cap (would sit pending on "
-      "QOSMaxCpuPerUserLimit)")
-for name, p in hpc_config.HPC_PARTITIONS.items():
-    for nodes in (1, 2, 3):
-        plan = hpc_config.plan_partition(name, nodes=nodes)
-        total = (plan["nodes"] * plan["npn"] * plan["cpt"]
-                 * plan["max_concurrent_jobs"])
-        check(f"{name} @ {nodes} node(s): {total} <= {p.cpu_cap} cores",
-              total <= p.cpu_cap, True)
+    print("npn * cpt fills exactly one node (no idle cores, no oversubscription)")
+    for name, p in table.items():
+        if p.cores_per_node > p.cpu_cap:
+            continue                # test: the cap, not the node, is the limit
+        plan = hpc_config.plan_partition(name, partitions=table)
+        check(f"{cluster}/{name}: {plan['npn']} x {plan['cpt']} == {p.cores_per_node} cores",
+              plan["npn"] * plan["cpt"], p.cores_per_node)
 
-print("\ntest's 8-core QoS cap shrinks the layout instead of overrunning it")
+    print("\none MPI rank per NUMA domain")
+    for name, p in table.items():
+        check(f"{cluster}/{name}: npn == {p.numa_per_node} NUMA domains",
+              hpc_config.plan_partition(name, partitions=table)["npn"],
+              p.numa_per_node)
+
+    print("\nno plan exceeds its QoS cap (would sit pending on "
+          "QOSMaxCpuPerUserLimit)")
+    for name, p in table.items():
+        for nodes in (1, 2, 3):
+            plan = hpc_config.plan_partition(name, nodes=nodes, partitions=table)
+            total = (plan["nodes"] * plan["npn"] * plan["cpt"]
+                     * plan["max_concurrent_jobs"])
+            check(f"{cluster}/{name} @ {nodes} node(s): {total} <= {p.cpu_cap} cores",
+                  total <= p.cpu_cap, True)
+
+print("\nhpc's test partition: 8-core QoS cap shrinks the layout instead of "
+      "overrunning it")
 plan = hpc_config.plan_partition("test")
 check("test: 2 ranks x 4 threads", (plan["npn"], plan["cpt"]), (2, 4))
 check("test: 1 concurrent job", plan["max_concurrent_jobs"], 1)
 
-print("\nthe HPC profile's literal defaults still equal "
-      "plan_partition('medium', nodes=1)")
-want = hpc_config.plan_partition("medium", nodes=1)
-got = {k: getattr(hpc_config.HPC, k) for k in want}
-check("HPC defaults", got, want)
+print("\nparam's debug partition: no QoS cap of its own, so the etiquette "
+      "ceiling (1 node) is what limits concurrency, not a real ValueError-\n"
+      "worthy overrun")
+plan = hpc_config.plan_partition("debug", partitions=hpc_config.PARAM_PARTITIONS)
+check("debug: 2 ranks x 24 threads", (plan["npn"], plan["cpt"]), (2, 24))
+check("debug: 1 concurrent job", plan["max_concurrent_jobs"], 1)
 
-print("\nhosts without a profiled table are not silently given hpc's")
-for host in (hpc_config.PARAM, hpc_config.LOCAL):
-    check(f"{host.name}: no partition table", host.partitions, {})
+print("\neach profiled host's literal defaults still equal "
+      "plan_partition(host.partition) -- nodes auto-computed to fill the "
+      "QoS cap (2026-08-23 resource-allocation policy) -- on its own table")
+for host, table in ((hpc_config.HPC, hpc_config.HPC_PARTITIONS),
+                     (hpc_config.PARAM, hpc_config.PARAM_PARTITIONS)):
+    want = hpc_config.plan_partition(host.partition, partitions=table)
+    got = {k: getattr(host, k) for k in want}
+    check(f"{host.name} defaults", got, want)
+
+print("\nhosts without a profiled table are not silently given another "
+      "cluster's")
+check("local: no partition table", hpc_config.LOCAL.partitions, {})
 
 print("\nan unknown queue name is refused, not guessed at")
 try:
     hpc_config.plan_partition("gpu")
 except ValueError:
-    print("  PASS  plan_partition('gpu') raises ValueError")
+    print("  PASS  plan_partition('gpu') raises ValueError on hpc's table")
 else:
     print("  FAIL  plan_partition('gpu') did not raise")
-    failures.append("unknown partition")
+    failures.append("unknown partition (hpc)")
+
+print("\nparam's gpu partition is deliberately excluded, not forgotten: it "
+      "needs a --gres=gpu request plan_partition() has no field for, and\n"
+      "this solver has no GPU code path")
+try:
+    hpc_config.plan_partition("gpu", partitions=hpc_config.PARAM_PARTITIONS)
+except ValueError:
+    print("  PASS  plan_partition('gpu', PARAM_PARTITIONS) raises ValueError")
+else:
+    print("  FAIL  plan_partition('gpu', PARAM_PARTITIONS) did not raise")
+    failures.append("unknown partition (param gpu)")
 
 print()
 if failures:

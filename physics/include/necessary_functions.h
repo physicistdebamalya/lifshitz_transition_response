@@ -121,6 +121,74 @@ inline std::ostream &operator<<(std::ostream &os, PulseKind pulse_kind)
     }
 }
 
+// The exact inverse of operator<< above. Any spelling operator<< would not
+// itself print is a hard error naming the valid ones -- so a typo in a
+// task.csv cell (`sin2` for `sin^2`) stops the run instead of silently
+// selecting a default pulse shape.
+PulseKind pulse_kind_from_string(const std::string &text);
+
+// ─────────────────────────────────────────────────────── task.csv reading ──
+//
+// One parameter point per file, one file per run directory. Parameters used
+// to be compile-time constexpr, rewritten into this source per point and
+// recompiled inside the run directory; that cannot work on param, where
+// `module load gcc/12.4` inside a SLURM job cannot find features.h
+// (verified 2026-08-22 on cn001; the same test succeeds on hpc's cn17).
+//
+// The format is deliberately the simplest thing that can carry a row: a
+// header line, one data line, comma-separated, no quoting and no escapes.
+// Cells are therefore forbidden from containing a comma, which the writer
+// (workflow/task_schema.py) enforces on its side and splitCSV's column-count
+// check catches on this one.
+
+std::string trim_cell(const std::string &text);
+std::vector<std::string> split_csv(const std::string &line);
+
+// A header cell this binary does not read would otherwise be IGNORED: the
+// parameter would keep whatever the loader left in that field and the run
+// would produce entirely plausible numbers for a point nobody chose. That is
+// the most dangerous failure mode this format introduces, so it is a hard
+// error naming the offending cell and listing what was expected.
+void require_known_columns(const std::string &path,
+                           const std::vector<std::string> &header,
+                           const std::vector<std::string> &known);
+
+// Every column is required. Unlike a hand-written task file, this one is
+// always produced by exactly one function (task_schema.write_task_csv), so a
+// missing column is always a bug -- and a default is the worst possible
+// response to a bug, because it produces numbers for a point nobody asked
+// for. There are no defaults anywhere in this path.
+void require_columns(const std::string &path,
+                     const std::vector<std::string> &header,
+                     const std::vector<std::string> &required);
+
+// One data row, addressed by column NAME so header order is irrelevant.
+class TaskRow
+{
+public:
+    TaskRow(std::string path, std::vector<std::string> header,
+            std::vector<std::string> cells);
+
+    // dbl() and integer() require the WHOLE cell to be consumed. Left to
+    // themselves std::stod("1.0junk") returns 1.0 and std::stoi("10.5")
+    // returns 10, both silently -- exactly the class of quiet wrong answer
+    // this layer exists to prevent.
+    double dbl(const std::string &key) const;
+    int integer(const std::string &key) const;
+    std::string text(const std::string &key) const;
+    PulseKind kind(const std::string &key) const;
+
+private:
+    const std::string &cell(const std::string &key) const;
+    std::string path_;
+    std::vector<std::string> header_, cells_;
+};
+
+// Opens `path`, skips blank and '#' lines, validates the header against
+// `known`, and requires EXACTLY ONE data row.
+TaskRow read_single_task_row(const std::string &path,
+                             const std::vector<std::string> &known);
+
 class PulseType
 {
 private:
