@@ -398,47 +398,6 @@ class Submitter:
                 return d
         raise RuntimeError("no free dir_NNNNN name after 1000 tries")
 
-    def job_script(self, exe="./exe_run"):
-        """Build job.sh.
-
-        Assembled by concatenation rather than a dedent'd f-string: the
-        interpolated module and env blocks are themselves multi-line, which
-        defeats dedent's common-prefix detection and silently leaves stray
-        indentation in front of #SBATCH directives, where slurm ignores them.
-        """
-        lines = ["#!/bin/bash",
-                 f"#SBATCH --job-name={self.job_name}_{self.iteration}",
-                 f"#SBATCH --partition={self.partition}",
-                 f"#SBATCH --qos={self.qos}",
-                 f"#SBATCH --nodes={self.nodes}",
-                 f"#SBATCH --ntasks-per-node={self.npn}",
-                 f"#SBATCH --cpus-per-task={self.cpt}",
-                 "#SBATCH --hint=nomultithread",
-                 "#SBATCH --output=mpi_logs_%j.out",
-                 "#SBATCH --error=mpi_logs_%j.err",
-                 *self.host.extra_sbatch,
-                 ""]
-
-        if self.host.modules:
-            lines += [self.host.module_block(), ""]
-
-        lines += ["cd $SLURM_SUBMIT_DIR", ""]
-
-        if self.host.env_exports:
-            lines += [*self.host.env_exports, ""]
-
-        lines += ["export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK",
-                  "export OMP_PROC_BIND=spread",
-                  "export OMP_PLACES=cores",
-                  "",
-                  f"mpirun {self.host.mpirun_flags} \\",
-                  "    --map-by ppr:${SLURM_NTASKS_PER_NODE}:node:PE=${SLURM_CPUS_PER_TASK} \\",
-                  f"    --bind-to core {exe}",
-                  "",
-                  "date",
-                  ""]
-        return "\n".join(lines)
-
     def record_directory(self, run_dir):
         with open(self.cwd / DIRECTORIES_TXT, "a") as f:
             f.write(f"{self.iteration}. {run_dir.name}\n")
@@ -775,9 +734,12 @@ class Submitter:
     #
     # K is the same number the poll loop used as its ceiling:
     # max_concurrent_jobs, which plan_partition() derives as
-    # cpu_budget // cores_per_job (param medium 240/48 = 5; hpc medium
-    # 80/32 = 2). The QoS core cap remains underneath as a backstop -- if
-    # other jobs of yours are already running, array elements simply pend on
+    # cpu_budget // cores_per_job. By default (2026-08-23 resource-allocation
+    # policy) a single point already claims the whole cap -- param medium
+    # 240/240 = 1 at 5 nodes, hpc large 80/80 = 1 at 2 nodes -- so K is
+    # usually 1 and the array runs its points strictly one after another.
+    # The QoS core cap remains underneath as a backstop -- if other jobs of
+    # yours are already running, array elements simply pend on
     # QOSMaxCpuPerUserLimit, which is SLURM enforcing the same budget the
     # loop used to poll for, without anything of ours having to be running.
 
@@ -788,10 +750,11 @@ class Submitter:
 #
 #   C++   physics/src/necessary_functions.cpp: `if (A0 == 0.0) return;`
 #         physics/models/*.cpp:                `if (A0X != 0.0 && ...)`
-#         -- exact, and deliberately so. It matches AM3.cpp, and A0 is a
-#         constexpr literal written into the source by change_lines(), not a
-#         computed quantity, so there is no rounding error for a tolerance to
-#         absorb.
+#         -- exact, and deliberately so. It matches AM3.cpp, and A0 reaches
+#         C++ through task_schema.py's repr()-round-trip guarantee (a task.csv
+#         cell parses via std::stod to the SAME double Python held when it
+#         wrote the cell), not a computed quantity, so there is no rounding
+#         error for a tolerance to absorb.
 #
 #   Python analysis/snippets.py: format_number() flushes |x| < 1e-12 to zero,
 #         and emit_pulse() then treats the channel as inactive.
@@ -826,67 +789,6 @@ def validate_point(p):
                 f"for with none of them, so it could never be found again. "
                 f"Use exactly 0.0 to switch the channel off, or an amplitude "
                 f"at or above {_A0_MIN:g}.")
-
-
-# ------------------------------------------------------------ source rewrite --
-# Interim mechanism, retired by the task.csv pass. Parameters are still
-# compile-time constants in the model sources, so a parameter point is
-# realised by rewriting the source and recompiling. Kept because it is what
-# restores a working pipeline today; every call site goes through
-# build_replacements() so the switch to task.csv touches one function.
-
-def change_lines(src_path, dst_path, replacements):
-    """Rewrite whole lines identified by their leading text.
-
-    Raises on an unmatched prefix rather than silently leaving the old value
-    in place -- a silent miss here means a job runs with the wrong parameter
-    and lands in the archive labelled as something it is not.
-    """
-    lines = Path(src_path).read_text().splitlines(keepends=True)
-    for prefix, new_line in replacements:
-        for i, line in enumerate(lines):
-            if line.lstrip().startswith(prefix):
-                lines[i] = new_line.rstrip("\n") + "\n"
-                break
-        else:
-            raise ValueError(f"no line starting with {prefix!r} in {src_path}")
-    Path(dst_path).write_text("".join(lines))
-
-
-_CPP_ENUM = {"sin^2": "Sin2", "Gaussian": "Gaussian", "sin": "Sin",
-             "cos": "Cos", "Linear": "Linear", "NA": "NA", "Envelope": "Envelope"}
-
-
-def build_replacements(p, schema):
-    """Derive the (prefix, new_line) list from the schema, so adding a
-    parameter means editing models.py rather than 30 call sites."""
-    def num(x):
-        x = float(x)
-        return int(x) if x.is_integer() else x
-
-    rep = []
-    for k in schema.scalars:
-        ctype = "int" if k in schema.ints else "double"
-        val = int(p[k]) if k in schema.ints else num(p[k])
-        rep.append((f"constexpr {ctype} {k} =", f"constexpr {ctype} {k} = {val};"))
-
-    rep.append(("constexpr double ETP =", f"constexpr double ETP = {num(p['ETP'])};"))
-    rep.append(("constexpr int TIME_DIVISION =",
-                f"constexpr int TIME_DIVISION = {int(p['TIME_DIVISION'])};"))
-
-    for axis in ("X", "Y"):
-        for base, ctype in (("A0", "double"), ("nu", "double"), ("sigma", "double"),
-                            ("ntt_sigma", "double"), ("delay", "double"),
-                            ("duration", "double"), ("number_of_cycle", "int")):
-            key = f"{base}{axis}"
-            val = int(p[key]) if ctype == "int" else num(p[key])
-            rep.append((f"constexpr {ctype} {key} =",
-                        f"constexpr {ctype} {key} = {val};"))
-        for base in ("pulse_type", "pulse_wrapper"):
-            key = f"{base}{axis}"
-            rep.append((f"const PulseKind {key} = PulseKind::",
-                        f"const PulseKind {key} = PulseKind::{_CPP_ENUM[p[key]]};"))
-    return rep
 
 
 # ------------------------------------------------------------- sweep expansion --
