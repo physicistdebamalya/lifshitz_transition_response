@@ -55,26 +55,65 @@ def tail_mask(time, parameters):
 
 
 def ratio_R(time_dot, j_dot, parameters):
-    """R = max(J_dot) / J_dot(t_end), measured on the post-pulse tail.
+    """R = max over all t of J_dot, over the peak that survives into the
+    post-pulse tail (t_end, t_final].
 
-    The dip in R against E_F is the Lifshitz-transition signature this project
-    exists to compute.
+        R = max_t J_dot(t) / max_{t in tail} J_dot(t)
+
+    Numerator and denominator are both peaks of the same signal, so R is the
+    factor by which the driven response exceeds what is left once the pulse is
+    off. That is the quantity dephasing acts on directly, and the dip in it
+    against E_F is the Lifshitz-transition signature this project exists to
+    compute.
+
+    Why the denominator is the tail PEAK and not J_dot(t_end) alone, which is
+    what the notebook cell this replaces labelled it. In the tail the system
+    evolves freely, so J_dot oscillates at the interband frequency and
+    J_dot(t_end) is one phase of that oscillation rather than its size. The
+    two agree exactly whenever the tail decays monotonically from t_end -- in
+    the 207-run two_band archive that is 206 of 207 runs for the x channel but
+    only 120 of 207 for y, and in 18 of them J_dot_y(t_end) has already
+    crossed zero and is NEGATIVE. Run 29967 (ef=1.04, dephase=0.1, T=0.1)
+    comes out as -22.3 that way and +9.48 as a ratio of peaks. A sign flip
+    from the choice of a single sample is not a measurement.
+
+    Both peaks are signed maxima, not maxima of |J_dot|: the pulse is built to
+    drive J_dot positive first (A(t_i) = 0 by assertion in C++ main), so the
+    largest excursion of interest is the positive one, and abs() here would
+    silently start reporting the recoil of whichever channel happens to swing
+    harder the other way.
 
     NOTE on archived data: runs written before 2026-08 stored results at the
     C++ stream default of 6 significant figures. Where J is large and slowly
     varying, consecutive samples were identical after rounding, so np.diff of
     them is quantization noise rather than a derivative. R computed from those
-    runs is unreliable for the x channel. Re-run, or treat with suspicion.
+    runs is unreliable for the x channel. Re-run, or treat with suspicion --
+    quantization_suspect() below flags them. All 207 runs of the 2026-08
+    two_band archive are clean.
     """
-    mask = tail_mask(time_dot, parameters)
-    idx = np.flatnonzero(mask)
-    if idx.size == 0:
+    tail = j_dot[np.flatnonzero(tail_mask(time_dot, parameters))]
+    if tail.size == 0:
         raise ValueError("no samples in the post-pulse window")
-    tail = j_dot[idx]
-    denom = tail[0]                      # J_dot at t_end
+    denom = float(np.max(tail))
     if denom == 0.0:
         return np.nan
-    return float(np.max(tail) / denom)
+    return float(np.max(j_dot)) / denom
+
+
+def tail_peak_offset(time_dot, j_dot, parameters):
+    """How far past t_end the post-pulse peak of J_dot actually sits.
+
+    Zero means the tail decays monotonically from t_end, so ratio_R's
+    denominator IS J_dot(t_end) and the two readings of "the ratio at the end
+    of the pulse" coincide. Anything else is a run where they do not, and is
+    worth seeing rather than averaging over -- it is the y channel ringing
+    after the drive, which is the thing dephasing damps.
+    """
+    _, t_end, _ = pulse_window(parameters)
+    idx = np.flatnonzero(tail_mask(time_dot, parameters))
+    if idx.size == 0:
+        raise ValueError("no samples in the post-pulse window")
+    return float(time_dot[idx[int(np.argmax(j_dot[idx]))]] - t_end)
 
 
 def quantization_suspect(j, ratio=0.01):
