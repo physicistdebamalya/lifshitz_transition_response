@@ -1,2 +1,0 @@
-System,alpha,beta,delta,m,Temperature,ef,dephase,N1,N2,b1_0,b1_1,b2_0,b2_1,k_origin_0,k_origin_1,TIME_DIVISION,ETP,A0X,nuX,sigmaX,ntt_sigmaX,delayX,durationX,number_of_cycleX,pulse_typeX,pulse_wrapperX,A0Y,nuY,sigmaY,ntt_sigmaY,delayY,durationY,number_of_cycleY,pulse_typeY,pulse_wrapperY
-Response of Lifshitz transition in a two-band model,1.0,0.5,0.5,0.1,0.02,0.02,0.0,31,31,4.0,0.0,0.0,4.0,-2.0,-2.0,1000,100.0,0.5,0.3,0.1,1.0,0.0,5.0,10,sin^2,Envelope,0.5,0.3,0.1,1.0,0.0,5.0,10,sin^2,Envelope

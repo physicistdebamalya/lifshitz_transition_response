@@ -1,1 +1,0 @@
-g++ -fopenmp -Wall -Wextra -I/home/debamalya/cpp_libraries/boost_1_89_0 -I/home/debamalya/cpp_libraries/eigen-5.0.0 -I/home/debamalya/cpp_libraries/gsl/build/include test.cpp pulse_type.cpp -L/home/debamalya/cpp_libraries/gsl/build/lib -lgsl -lgslcblas -lm -o exe_test

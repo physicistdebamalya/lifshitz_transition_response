@@ -1,58 +1,33 @@
-# ---- build artifacts ----
+# Git tracks source and build files only: C++ (*.cpp, *.h), Python (*.py), the
+# Makefiles and physics/host.mk, the toolchain definition physics/Makefile includes.
+# Everything else is ignored by default -- documents (.md/.tex are kept in step
+# between the machines by research_backup/sync.py), notebooks (FreeFileSync),
+# data, figures, legacy/ and tool state. To start tracking a new kind of file,
+# add a `!` line to the whitelist below.
+
+*
+!*/
+!.gitignore
+!.gitattributes
+!*.cpp
+!*.h
+!*.py
+!Makefile*
+!/physics/host.mk
+
+# Never tracked, even when a file inside matches the whitelist.
+CLAUDE.md
+/legacy/
 build/
-*.o
-*.d
-exe_*
-*.out
-*.err
-
-# ---- notebooks (tracked content lives in .py modules) ----
-*.ipynb
+__pycache__/
 .ipynb_checkpoints/
+.claude/
+.vscode/
 
-# ---- data: never in git; archive lives under ~/ComputationData ----
-*.csv
-*.npz
-*.npy
-data.csv
-parameters.txt
-logfile*.txt
-directories.txt
-detailed_output.log
-tmp_log*
-mpi_logs_*
-
-# ---- run scratch produced by the submitter ----
+# Run roots: <repo>/<model>/ is where generator_<model>.py works, and run
+# scratch the submitter creates.
+/two_band/
+/four_band/
 dir_[0-9][0-9][0-9][0-9][0-9]/
 incomplete_runs/
-.submit_lock
-job.sh
-
-# ---- python ----
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-
-# ---- figures (regenerated from the archive) ----
-*.png
-*.pdf
-*.jpg
-
-# ---- latex build artifacts (docs/*.tex is the source; the PDF is regenerable) ----
-*.aux
-*.toc
-*.lof
-*.lot
-*.log
-*.fls
-*.fdb_latexmk
-*.synctex.gz
-
-# ---- editor / OS ----
-.vscode/
-.DS_Store
-*.swp
-
-# ---- mathematica ----
-*.nb.bak
+array_logs/
