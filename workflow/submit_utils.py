@@ -24,6 +24,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -35,7 +36,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
 
-from data_utils import clean_path, parse_master_log          # noqa: E402
+from data_utils import parse_master_log                        # noqa: E402
 from models import MODELS                                     # noqa: E402
 from snippets import (CreateSnippet, DEFAULT_IGNORE_PATTERNS,  # noqa: E402
                       find_key_by_substring)
@@ -63,6 +64,101 @@ ARRAY_MAP         = "array_map.txt"
 ARRAY_JOB_ID      = ".array_job_id"
 ARRAY_LOG_DIR     = "array_logs"
 
+# Every per-point line the sweep loop produces. The terminal gets the summary;
+# this gets the detail, because 207 "skip"/"prepared" lines scrolled the two
+# lines that mattered -- the resource plan and the sbatch result -- out of the
+# window they were needed in. Append-only and block-delimited, the same shape
+# as logfile.txt (philosophy §8), so successive submissions into one run root
+# stay readable and greppable rather than overwriting each other.
+SUBMIT_LOG        = "submission_log.txt"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Where things are, derived rather than tabulated
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One rule for the workstation and both clusters: the repository knows where
+# it is, so nothing here needs a per-host table of absolute paths to be kept
+# in step by hand.
+#
+#   <repo>/workflow/submit_utils.py   this file  -> repo_root()
+#   <repo>/<model>/                   run root   -> run_root_for(model)
+#   <repo>/archive/<model>_model/     registry   -> default_archive(model)  (cluster)
+#
+# run_root_for() replaces Path.cwd(). The cwd rule was invisible in exactly
+# the way that costs something: running the generator from workflow/ instead
+# of from the model's own directory put 96 dir_NNNNN into the source tree,
+# under a directories.txt that no later `down <model>` could separate. The
+# generator is already cwd-independent everywhere else -- its imports and its
+# build step both resolve from __file__ -- so this makes the run directories
+# agree with the rest of it.
+#
+# <repo>/<model> is also exactly the directory hpc_transfers.py creates on a
+# push (remote_model_root()), so a pushed tree is ready for the generator
+# with no cd and no --archive to remember.
+
+
+def repo_root():
+    """This project's root, from this file's own location.
+
+    Not Path.cwd() and not a per-host constant: the generator must land its
+    run directories in the same place whether it is invoked from the model
+    directory, from workflow/, or from $HOME on a cluster.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def run_root_for(model):
+    """<repo>/<model> -- where this model's dir_NNNNN and directories.txt live.
+
+    One directory per model, because `hpc_transfers.py down <model>` has to be
+    able to tell the two models' runs apart, and a shared directory puts both
+    under a single directories.txt that no later download can split.
+    """
+    if model not in MODELS:
+        raise ValueError(f"unknown model {model!r}; have {sorted(MODELS)}")
+    return repo_root() / model
+
+
+# The workstation archive. Named once, here, and read by the generators, by
+# hpc_transfers.py and by the tests -- it used to be a literal in each of
+# them. READ ONLY: ~/.claude/CLAUDE.md and the philosophy's §20 both make this
+# tree off limits for writing, and nothing in workflow/ ever writes to it.
+WORKSTATION_ARCHIVE = Path("/home/debamalya/ComputationData/PostDoc/"
+                           "programming/new/data")
+
+# Where a push puts the registries, relative to the repository root. The
+# cluster has no ~/ComputationData, so already_exists() reads the copy that
+# travelled with the code.
+ARCHIVE_SUBDIR = "archive"
+
+
+def archive_dirname(model):
+    """The per-model archive directory name, in one place. `data/two_band_model`
+    on the workstation, `archive/two_band_model` on a cluster -- same leaf."""
+    return f"{model}_model"
+
+
+def default_archive(model, host=None):
+    """The registry already_exists() should read, for wherever this is running.
+
+    On the workstation that is the real archive; on a cluster it is the copy
+    hpc_transfers.py pushed alongside the code. Derived instead of passed so
+    that forgetting `--archive` on a cluster cannot silently turn a sweep whose
+    points are all archived into a sweep that recomputes all of them --
+    which is what a missing registry does, loudly but too late to be free.
+    """
+    if model not in MODELS:
+        raise ValueError(f"unknown model {model!r}; have {sorted(MODELS)}")
+    # detect_host(), not the Submitter's --host. Those answer different
+    # questions: --host picks which cluster's RESOURCES to size the job for,
+    # and can legitimately be forced to "param" during a dry run on the
+    # workstation -- where the archive is still the workstation's. The
+    # registry follows the filesystem this process can actually see.
+    host = host or hpc_config.detect_host()
+    if host == "local":
+        return WORKSTATION_ARCHIVE / archive_dirname(model)
+    return repo_root() / ARCHIVE_SUBDIR / archive_dirname(model)
+
 
 @lru_cache(maxsize=8)
 def _parse_cached(log_path_str, system):
@@ -71,68 +167,203 @@ def _parse_cached(log_path_str, system):
     return parse_master_log(Path(log_path_str), system)
 
 
-def count_running_jobs(user, partition):
-    out = subprocess.run(f"squeue -u {user} -p {partition} --noheader | wc -l",
-                         shell=True, capture_output=True, text=True)
-    return int(out.stdout.strip() or 0)
+def live_jobs_by_workdir(user, timeout=30):
+    """{workdir: [(job id, state), ...]} for this user's queued and running jobs.
 
+    Returns None -- never {} -- when squeue could not be reached. The two mean
+    opposite things to every caller here.
 
-def cpus_in_use(user):
-    """Cores this user holds RUNNING, cluster-wide -- the unit and the scope
-    the QoS ceiling actually enforces.
-
-    `fatqos` caps MaxTRESPU at cpu=80 across small+medium+large together on
-    hpc; `iitgn_qos` caps it at cpu=240 across small+medium+large+highmemory
-    (+gpu) together on param. Both are the same shape of ceiling -- one pool,
-    several partitions -- so a throttle that counts jobs in one partition
-    measures the wrong thing twice over on either cluster: wrong unit (a
-    64-core job and a 32-core job are not interchangeable) and wrong scope
-    (work queued on medium is invisible while submitting to large). Adapted
-    from Superconductivity/python/submit_utils_Phase.py.
-
-    PENDING jobs hold no TRES yet -- that is exactly why SLURM lets them queue
-    rather than rejecting them -- so they are deliberately not counted.
-    Returns None if squeue cannot be reached, which the caller must treat as
-    "unknown", never as "zero".
+    %Z is the SUBMIT directory. For an array element that is the directory the
+    array was sbatched from, NOT the run directory the element cds into, which
+    is why this cannot be used to match dir_NNNNN to jobs one by one (see
+    _array_still_live). It is exactly the right key for the one question it is
+    asked: is a job of mine live somewhere in this repository?
     """
     try:
-        out = subprocess.run(["squeue", "-u", user, "-t", "running", "-h", "-o", "%C"],
-                             capture_output=True, text=True, check=True, timeout=30)
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    return sum(int(n) for n in out.stdout.split())
-
-
-def get_active_job_info(user):
-    """{workdir: (job_id, state)} for this user's live jobs, or None if squeue
-    could not be reached -- None and {} mean very different things here."""
-    try:
         out = subprocess.run(["squeue", "-u", user, "--noheader", "-o", "%i|%T|%Z"],
-                             capture_output=True, text=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+                             capture_output=True, text=True, check=True,
+                             timeout=timeout)
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired):
         return None
-    info = {}
+    jobs = {}
     for line in out.stdout.splitlines():
         parts = line.strip().split("|")
         if len(parts) == 3:
             job_id, state, workdir = parts
-            info[workdir] = (job_id, state)
-    return info
+            jobs.setdefault(workdir, []).append((job_id, state))
+    return jobs
+
+
+# NOTE (2026-08-27): count_running_jobs(), cpus_in_use() and
+# get_active_job_info() lived here and are gone. All three existed to feed
+# wait_for_slot(), the poll loop that `#SBATCH --array=0-N%K` replaced, and
+# nothing has called them since. Each also had a failure mode worth not
+# keeping: count_running_jobs() reported zero running jobs when squeue could
+# not be reached at all, and get_active_job_info() matched live jobs by
+# squeue's %Z, which an array element reports as the SUBMIT directory rather
+# than its run directory -- the miss that _array_still_live() exists to
+# avoid. Dead code that is also wrong is the kind that gets called again.
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The pre-submission gate
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One sbatch here dispatches a whole array, and the array is sized to occupy
+# this user's entire core budget per point (see CLAUDE.md, "Resource
+# allocation defaults"). There is no throttle to catch a mistake afterwards
+# and no per-point compile to fail slowly: the next thing after this gate is
+# N points running at full width. So the gate is typed, not a keystroke.
+#
+# It lives here rather than in each generator because both generators must ask
+# the identical question -- a second copy is how the two drift, which is the
+# same failure that put a stale -mtune in Makefile.job (CLAUDE.md, "hpc runs
+# before 2026-08-21").
+
+CONFIRM_TIMEOUT_S = 120
+
+# What SLURM will accept after --job-name= without quoting, and what a shell
+# reading array_logs/<name>_*.out will not misparse. Checked rather than
+# quoted, because a name carrying a space or a $ is far more likely to be a
+# typo than an intention.
+JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError
+
+
+def _ask(prompt, timeout=CONFIRM_TIMEOUT_S):
+    """input() that cannot leave a login-node shell blocked forever.
+
+    A generator is run from an interactive login-node shell and then exits in
+    seconds. If it is ever started detached, an unanswered input() would hold
+    the terminal open indefinitely with no indication why, so the read is
+    given an alarm and a timeout is a cancel -- never a default answer.
+    """
+    if hasattr(signal, "SIGALRM"):
+        previous = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+        try:
+            return input(prompt)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+    return input(prompt)
+
+
+def confirm_and_job_name(default_name, summary=(), timeout=CONFIRM_TIMEOUT_S,
+                         interactive=None, name=None):
+    """Show the plan, require a typed "yes", then read the SLURM job name.
+
+    Returns the job name to put on the array. Any answer other than exactly
+    "yes" aborts, as does a timeout, an EOF, or a name that is not a legal
+    --job-name value after three attempts. Nothing is prepared, locked, built
+    or submitted before this returns.
+
+    Parameters
+    ----------
+    default_name : name used when the job-name answer is left empty. The
+        model's own default, so pressing Enter is a choice rather than a gap.
+    summary : lines describing what is about to be submitted, printed above
+        the prompt. This is the only place the operator sees the sweep width
+        and the skip/recompute mode together, which is what makes "yes"
+        meaningful rather than reflexive.
+    name : answers the SECOND question (--name on the command line) and is
+        still validated. It does NOT answer the first: the generator used to
+        skip this whole call when --name was given, so a flag whose documented
+        job is to name the array quietly removed the confirmation as well.
+        There is one way past this gate and it is typing yes.
+    interactive : override the tty test. Default None = ask sys.stdin.
+
+    Raises
+    ------
+    SystemExit : on decline, timeout, EOF, no terminal, or a rejected name.
+        Always SystemExit and never a return value the caller might ignore --
+        a gate that can be accidentally passed is not a gate
+        (research_backup/.../research_code_development_philosophy.md, Part I).
+    """
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+
+    for line in summary:
+        print(line, flush=True)
+
+    # Same reasoning as the resume/begin decision below: inside a batch job
+    # there is no stdin, and input() would block until the walltime killed it
+    # hours later with nothing in the log to say why. Refusing loudly beats
+    # both that and the alternative of assuming "yes" on a sweep this size.
+    if not interactive:
+        raise SystemExit(
+            "❌ this process has no terminal to confirm on, and a sweep is "
+            "never submitted unconfirmed. Run the generator from an "
+            "interactive login-node shell.")
+
+    try:
+        if _ask('\n⚠️  Type yes to submit these jobs '
+                f'({timeout}s timeout): ', timeout) != "yes":
+            raise SystemExit("🛑 Cancelled. Nothing was prepared or submitted.")
+
+        if name is not None:
+            if not JOB_NAME_RE.match(name):
+                raise SystemExit(
+                    f"❌ --name {name!r} is not usable after --job-name=. "
+                    f"Letters, digits, dot, dash, underscore; must start with "
+                    f"a letter or digit; 64 characters at most. Nothing was "
+                    f"prepared or submitted.")
+            print(f"📛 Job name for the array: {name}  (from --name)", flush=True)
+            return name
+
+        for attempt in (1, 2, 3):
+            name = _ask(f'📛 Job name for the array [{default_name}] '
+                        f'({timeout}s timeout): ', timeout).strip()
+            if not name:
+                return default_name
+            if JOB_NAME_RE.match(name):
+                return name
+            print(f"   ✗ {name!r} is not usable after --job-name=. Letters, "
+                  f"digits, dot, dash, underscore; must start with a letter "
+                  f"or digit; 64 characters at most."
+                  + (f"  ({3 - attempt} attempt(s) left)" if attempt < 3 else ""),
+                  flush=True)
+    except TimeoutError:
+        raise SystemExit(f"⏳ No answer in {timeout}s. Cancelled. Nothing was "
+                         f"prepared or submitted.")
+    except EOFError:
+        raise SystemExit("❌ stdin closed before the gate was answered. "
+                         "Cancelled. Nothing was prepared or submitted.")
+
+    raise SystemExit("❌ No usable job name after 3 attempts. Cancelled. "
+                     "Nothing was prepared or submitted.")
 
 
 class Submitter:
-    def __init__(self, model, host=None, data_path=None, dry_run=False):
+    def __init__(self, model, host=None, data_path=None, dry_run=False,
+                 run_root=None):
         if model not in MODELS:
             raise ValueError(f"unknown model {model!r}; have {sorted(MODELS)}")
         self.model = model
         self.schema = MODELS[model]
         self.host = hpc_config.get(host)
-        self.cwd = Path.cwd()
+        # <repo>/<model>, derived from this file (run_root_for). NOT Path.cwd():
+        # see the comment above repo_root(). run_root= exists for tests that
+        # need a scratch tree; production passes nothing and gets the one
+        # layout, on the workstation and on both clusters alike.
+        self.run_root = Path(run_root) if run_root else run_root_for(model)
         self.dry_run = dry_run
         self.iteration = 0
         self.job_name = "run"
-
-        self.data_path = Path(clean_path(str(data_path))) if data_path else self.cwd
+        # expanduser(), NOT data_utils.clean_path(). clean_path maps between
+        # this workstation's two roots (/home/debamalya <-> D:) and prefixes
+        # anything it does not recognise with /home/debamalya -- so on hpc it
+        # turned /iitgn/homedirs/<user>/projects/new/archive/two_band_model
+        # into /home/debamalya//iitgn/homedirs/..., a path that cannot exist.
+        # already_exists() would then find no registry and submit every
+        # archived point as new. It is an analysis-side helper for this
+        # machine's filesystem, and a cluster is not this machine.
+        self.data_path = (Path(data_path).expanduser() if data_path
+                          else default_archive(model))
 
         for k in ("partition", "qos", "nodes", "npn", "cpt",
                   "max_concurrent_jobs", "slurm_user"):
@@ -214,7 +445,10 @@ class Submitter:
         lines[-1] += (f"  ({min(self.cpu_budget, self.max_concurrent_jobs * need)}"
                       f"/{p.cpu_cap} core budget)")
         lines.append(f"  {p.cpu}, {p.cores_per_node} cores/node, "
-                     f"{p.numa_per_node} NUMA domain(s), walltime {p.walltime}")
+                     f"{p.numa_per_node} NUMA domain(s)")
+        # No walltime here. The job requests none (array_script), so the queue
+        # default applies, and that number belongs to the administrators --
+        # `scontrol show partition <queue>` is the live answer.
 
         per_node = self.npn * self.cpt
         if per_node != p.cores_per_node:
@@ -225,23 +459,70 @@ class Submitter:
                          f"{p.cpu_cap} — it will never start")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------ run root --
+    def ensure_run_root(self):
+        """Create <repo>/<model>/ if it is not there, and say so when it does.
+
+        Called once by the generator, right after the confirmation gate.
+        Separate from __init__ because constructing a Submitter must not
+        create directories -- the archive-match test builds one only to ask
+        already_exists() questions -- and separate from new_run_dir() because
+        a run root that appears silently is how 96 run directories ended up in
+        workflow/ without anyone noticing until a download could not tell the
+        two models apart.
+        """
+        if self.run_root.exists():
+            if not self.run_root.is_dir():
+                raise SystemExit(
+                    f"🚨 ensure_run_root: {self.run_root} exists and is not a "
+                    f"directory. That is where {self.model}'s run directories "
+                    f"go; move or remove it before submitting.")
+            return self.run_root
+        self.run_root.mkdir(parents=True)
+        print(f"created run root {self.run_root}", flush=True)
+        return self.run_root
+
+    def _require_run_root(self):
+        """Every writer goes through here, so a missing run root is one
+        sentence naming the fix rather than a FileNotFoundError raised from
+        inside iterdir() three frames down."""
+        if not self.run_root.is_dir():
+            raise SystemExit(
+                f"🚨 run root {self.run_root} does not exist. ensure_run_root() "
+                f"must run before any point is prepared -- the generator calls "
+                f"it after the confirmation gate.")
+        return self.run_root
+
     # ---------------------------------------------------------------- lock --
     def acquire_lock(self):
-        lock = self.cwd / LOCKFILE
+        lock = self._require_run_root() / LOCKFILE
         if lock.exists():
             raise SystemExit(
-                f"{LOCKFILE} exists in {self.cwd} — another submitter may be "
+                f"{LOCKFILE} exists in {self.run_root} — another submitter may be "
                 f"running. Remove it if you are sure it is stale.")
         lock.write_text(str(os.getpid()))
         self._lockfile = lock
         atexit.register(self.release_lock)
 
     def release_lock(self):
+        """Remove the lock, and say so loudly if it could not be removed.
+
+        Registered with atexit, so raising here would replace whatever the
+        process was already exiting for. But swallowing the error is worse in
+        its own way: a lock left behind stops the NEXT submission with
+        "another submitter may be running", and the operator then has no
+        record of which run left it or why. Reported, not raised, and never
+        silent.
+        """
+        if not (self._lockfile and self._lockfile.exists()):
+            return
         try:
-            if self._lockfile and self._lockfile.exists():
-                self._lockfile.unlink()
-        except OSError:
-            pass
+            self._lockfile.unlink()
+        except OSError as e:
+            print(f"⚠️  release_lock: could not remove {self._lockfile} ({e}). "
+                  f"The next submission will refuse to start until it is gone "
+                  f"-- delete it by hand once you have checked nothing else is "
+                  f"submitting here.", flush=True)
 
     # ------------------------------------------------------------- dedup ---
     def already_exists(self, p, data_path=None, master_log=MASTER_LOG,
@@ -283,8 +564,19 @@ class Submitter:
                     for line in f:
                         if COMPLETION_MARKER in line:
                             return True
-            except OSError:
-                continue
+            except OSError as e:
+                # An unreadable log used to be skipped, which made it
+                # indistinguishable from one that simply has no marker -- and
+                # "no marker" is what preparing_run() acts on by quarantining
+                # or DELETING the directory. A log this process cannot read is
+                # not evidence about the run; it is a fact about the
+                # filesystem, and it stops the sweep rather than deciding the
+                # question the wrong way.
+                raise SystemExit(
+                    f"🚨 is_job_complete: cannot read {log} ({e}). Whether "
+                    f"{run_dir.name} finished cannot be decided, and the next "
+                    f"step would be to quarantine or delete it. Fix the "
+                    f"permissions or move the directory aside by hand.")
         return False
 
     def preparing_run(self, interactive=None):
@@ -295,7 +587,9 @@ class Submitter:
         'resume' would move the folder out from under it and 'begin' would
         delete it. See AM3_submit_utils.preparing_run.
         """
-        dir_txt = self.cwd / DIRECTORIES_TXT
+        self.refuse_foreign_repo_jobs()
+
+        dir_txt = self.run_root / DIRECTORIES_TXT
         if not dir_txt.exists():
             return 0
 
@@ -304,7 +598,7 @@ class Submitter:
         for line in lines:
             parts = line.split(". ", 1)
             d_name = parts[1] if len(parts) == 2 else line.split()[-1]
-            d = self.cwd / d_name
+            d = self.run_root / d_name
             if d.exists() and self.is_job_complete(d):
                 start_index += 1
             else:
@@ -363,12 +657,12 @@ class Submitter:
                        "[begin] delete and start over, [abort]: ").strip().lower()
 
         if choice == "resume":
-            backup = self.cwd / BACKUP_DIRNAME
+            backup = self.run_root / BACKUP_DIRNAME
             backup.mkdir(exist_ok=True)
             for line in lines[start_index:]:
                 parts = line.split(". ", 1)
                 d_name = parts[1] if len(parts) == 2 else line.split()[-1]
-                d = self.cwd / d_name
+                d = self.run_root / d_name
                 if d.exists():
                     shutil.move(str(d), str(backup / d_name))
             dir_txt.write_text("\n".join(lines[:start_index]) + "\n")
@@ -376,7 +670,7 @@ class Submitter:
             for line in lines:
                 parts = line.split(". ", 1)
                 d_name = parts[1] if len(parts) == 2 else line.split()[-1]
-                d = self.cwd / d_name
+                d = self.run_root / d_name
                 if d.exists():
                     shutil.rmtree(d)
             dir_txt.unlink()
@@ -387,20 +681,116 @@ class Submitter:
         self.iteration = start_index
         return start_index
 
+    def refuse_foreign_repo_jobs(self):
+        """Refuse to submit while a job of this user is live in THIS repository
+        but outside every model's run root.
+
+        The case this exists for is real and was live on hpc on 2026-08-27:
+        array 214963 was still running 46 elements out of
+        ~/projects/new/workflow/, because run directories used to be created
+        in the cwd and the generator had been invoked from there. Moving the
+        run root to <repo>/<model> makes that array invisible to
+        preparing_run() -- it reads .array_job_id in the NEW root, which is
+        empty and freshly created -- so a second array for the same 46 points
+        would go out beside the first, both drawing on one 80-core cap and
+        both computing the same physics.
+
+        Scoped to this repository and to directories that are not run roots,
+        so the legitimate case stays legitimate: a live four_band array
+        submitted from <repo>/four_band is a run root and does not block a
+        two_band submission, while this model's OWN live array is caught more
+        precisely by _array_still_live() a few lines below.
+
+        squeue unreachable is reported and does not block -- the check cannot
+        be the reason a submission is impossible on a machine where nothing
+        can be verified either way.
+        """
+        jobs = live_jobs_by_workdir(self.slurm_user)
+        if jobs is None:
+            print(f"⚠️  refuse_foreign_repo_jobs: could not reach squeue, so "
+                  f"nothing was checked. Confirm by hand that no earlier "
+                  f"sweep of this repository is still queued.", flush=True)
+            return
+
+        root = repo_root().resolve()
+        known = {run_root_for(m).resolve() for m in MODELS}
+        foreign = {}
+        for workdir, entries in jobs.items():
+            try:
+                d = Path(workdir).resolve()
+            except OSError:
+                continue
+            inside_repo = d == root or root in d.parents
+            if not inside_repo or d in known:
+                continue
+            foreign[d] = entries
+
+        if not foreign:
+            return
+
+        detail = "\n".join(
+            f"     {d}: " + ", ".join(f"{j} ({s})" for j, s in entries[:4])
+            + (", ..." if len(entries) > 4 else "")
+            for d, entries in sorted(foreign.items()))
+        raise SystemExit(
+            f"🚨 a job of yours is still live inside {root}, submitted from a "
+            f"directory that is not any model's run root:\n{detail}\n"
+            f"   Run directories used to be created in the current directory; "
+            f"they are now created in <repo>/<model>/, so that sweep is "
+            f"invisible to this one and submitting now would put a second "
+            f"array of the same points beside it, on the same core budget.\n"
+            f"   Wait for it (squeue -u {self.slurm_user}), or scancel it, "
+            f"then rerun. Nothing was prepared or submitted.")
+
     # -------------------------------------------------------------- submit --
     def new_run_dir(self):
-        existing = {d.name for d in self.cwd.iterdir() if d.is_dir()}
+        root = self._require_run_root()
+        existing = {d.name for d in root.iterdir() if d.is_dir()}
         for _ in range(1000):
             candidate = f"dir_{random.randint(10000, 99999)}"
             if candidate not in existing:
-                d = self.cwd / candidate
+                d = root / candidate
+                # No exist_ok: the name was just checked against everything in
+                # this directory, so a collision here means something else is
+                # writing into the run root at the same time, and two sweeps
+                # sharing one directories.txt is precisely what must not
+                # happen quietly.
                 d.mkdir()
                 return d
         raise RuntimeError("no free dir_NNNNN name after 1000 tries")
 
     def record_directory(self, run_dir):
-        with open(self.cwd / DIRECTORIES_TXT, "a") as f:
+        with open(self._require_run_root() / DIRECTORIES_TXT, "a") as f:
             f.write(f"{self.iteration}. {run_dir.name}\n")
+
+    # ------------------------------------------------------ submission log --
+    def open_submission_log(self, header_lines=()):
+        """Start this invocation's block in <run root>/submission_log.txt.
+
+        The per-point lines go here and not to the terminal. On a 207-point
+        sweep they pushed the two lines that decide whether to intervene --
+        the resource plan and the sbatch result -- off the top of the screen,
+        while adding nothing that is not also in directories.txt and the
+        task.csv files. What the terminal keeps is the summary and anything
+        that went wrong.
+        """
+        self._require_run_root()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        head = (f"\n{'=' * 78}\n"
+                f"submission {stamp}  model={self.model}  host={self.host.name}\n")
+        body = "".join(f"{line}\n" for line in header_lines)
+        with open(self.run_root / SUBMIT_LOG, "a") as f:
+            f.write(head + body)
+        return self.run_root / SUBMIT_LOG
+
+    def note(self, line):
+        """One line into the submission log. Never to the terminal."""
+        with open(self._require_run_root() / SUBMIT_LOG, "a") as f:
+            f.write(f"{line}\n")
+
+    @property
+    def submission_log(self):
+        return self.run_root / SUBMIT_LOG
 
     def prepare(self, p, repo=None):
         """Realise one parameter point as a run directory, ready to run.
@@ -425,20 +815,21 @@ class Submitter:
         try:
             write_task_csv(run_dir / "task.csv", p, self.schema)
         except (KeyError, ValueError) as e:
-            shutil.rmtree(run_dir, ignore_errors=True)
+            self._discard(run_dir)
             self._quarantine_reason(run_dir.name, "task.csv could not be written", str(e))
             return None
 
         if self.dry_run:
-            print(f"  [dry-run] prepared {run_dir.name} "
-                  f"(task.csv written, binary not copied)", flush=True)
+            # No per-point note here: the caller already logs one line per
+            # prepared point, and the log's header block records dry run =
+            # True, which is the only thing that differs.
             self.iteration += 1
             self.record_directory(run_dir)
             return run_dir
 
         binary = self.binary_path(repo)
         if not binary.exists():
-            shutil.rmtree(run_dir, ignore_errors=True)
+            self._discard(run_dir)
             raise SystemExit(
                 f"model binary missing: {binary}\n"
                 f"ensure_binary() must run before the sweep loop -- the "
@@ -517,17 +908,37 @@ class Submitter:
     def max_array_size(self):
         """SLURM's MaxArraySize, read live. 1001 on both clusters as of
         2026-08-22, but a sweep is refused against the live value rather than
-        a remembered one."""
+        a remembered one.
+
+        None means the limit is UNKNOWN, never "no limit". Off-cluster that is
+        silent and expected; on a cluster it is said out loud, because the
+        caller's next move is to submit without having checked.
+        """
         try:
             out = subprocess.run(["scontrol", "show", "config"],
                                  capture_output=True, text=True, check=True,
                                  timeout=20).stdout
-            return int(re.search(r"MaxArraySize\s*=\s*(\d+)", out).group(1))
-        except Exception:
+        except FileNotFoundError:
+            return None                  # no scontrol: not a cluster
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"⚠️  max_array_size: `scontrol show config` failed "
+                  f"({type(e).__name__}); submitting without checking the "
+                  f"array-size limit.", flush=True)
             return None
+        found = re.search(r"MaxArraySize\s*=\s*(\d+)", out)
+        if not found:
+            print(f"⚠️  max_array_size: no MaxArraySize in `scontrol show "
+                  f"config`; submitting without checking the array-size "
+                  f"limit.", flush=True)
+            return None
+        return int(found.group(1))
 
-    def array_script(self, count, walltime=None, exe="./exe_run",
-                     task_file="task.csv"):
+    # A `#SBATCH` line after the first executable line is IGNORED by sbatch,
+    # silently. So is one that does not start at column 0. Both are checked
+    # rather than trusted -- see _validate_batch_script.
+    _SBATCH = "#SBATCH"
+
+    def array_script(self, count, exe="./exe_run", task_file="task.csv"):
         """The one job script an entire sweep runs under.
 
         Every element is the SAME binary on the SAME resources, differing only
@@ -535,7 +946,18 @@ class Submitter:
         and exactly what became possible once parameters stopped being
         compiled in.
 
-        Two details that are not cosmetic:
+        Built as a list of lines, NOT as one dedented f-string. That is not a
+        style preference. `textwrap.dedent(f"...")` interpolates first and
+        dedents second, so the moment a substituted value carries its own
+        newlines -- the module block does, on both clusters -- the common
+        indent it can strip becomes the empty string and dedent returns the
+        template untouched. Every line, `#!/bin/bash` included, then keeps the
+        source file's indentation, and sbatch rejects the whole thing with
+        "This does not look like a batch script. The first line must start
+        with #!". It failed that way on param on 2026-08-27, after the sweep
+        had already prepared 24 run directories.
+
+        Three details that are not cosmetic:
 
         1. THE LOG REDIRECT. #SBATCH --output is resolved relative to the
            submit directory, and an array is submitted once from the parent,
@@ -548,30 +970,44 @@ class Submitter:
            success -- the same shape as the venv bug in
            hpc_job_failure_modes.md, where a failed `source` did not stop the
            script and the run silently used the wrong Python.
+        3. NO `--time`. The queue's limit is the cluster administrator's to
+           set: a job that requests nothing gets the queue default, which is
+           the number they chose. Requesting one here would be this project
+           re-deciding it from a table that nobody re-measures, and a table
+           that drifts LOW silently shortens every run.
         """
-        p = (self.host.partitions or {}).get(self.partition)
-        walltime = walltime or (p.walltime if p else "1-00:00:00")
+        if count < 1:
+            raise ValueError(f"array_script: an array needs at least one "
+                             f"element, got {count}")
 
-        lines = ["#!/bin/bash",
-                 f"#SBATCH --job-name={self.job_name}",
-                 f"#SBATCH --partition={self.partition}",
-                 f"#SBATCH --qos={self.qos}",
-                 f"#SBATCH --nodes={self.nodes}",
-                 f"#SBATCH --ntasks-per-node={self.npn}",
-                 f"#SBATCH --cpus-per-task={self.cpt}",
-                 "#SBATCH --hint=nomultithread",
-                 f"#SBATCH --time={walltime}",
-                 # %N throttling: SLURM itself runs at most this many elements
-                 # at once. This replaces the old Python wait_for_slot() poll
-                 # loop, and with it the only reason the submitting process had
-                 # to stay alive at all.
-                 f"#SBATCH --array=0-{count - 1}%{self.max_concurrent_jobs}",
-                 f"#SBATCH --output={ARRAY_LOG_DIR}/%A_%a.out",
-                 f"#SBATCH --error={ARRAY_LOG_DIR}/%A_%a.err",
-                 *self.host.extra_sbatch,
-                 "",
-                 "set -e",
-                 ""]
+        directives = [f"--job-name={self.job_name}",
+                      f"--partition={self.partition}",
+                      f"--qos={self.qos}",
+                      f"--nodes={self.nodes}",
+                      f"--ntasks-per-node={self.npn}",
+                      f"--cpus-per-task={self.cpt}",
+                      "--hint=nomultithread",
+                      # %K throttling: SLURM itself runs at most this many
+                      # elements at once. This replaces the old Python
+                      # wait_for_slot() poll loop, and with it the only reason
+                      # the submitting process had to stay alive at all.
+                      f"--array=0-{count - 1}%{self.max_concurrent_jobs}",
+                      f"--output={ARRAY_LOG_DIR}/%A_%a.out",
+                      f"--error={ARRAY_LOG_DIR}/%A_%a.err"]
+
+        lines = ["#!/bin/bash"]
+        lines += [f"{self._SBATCH} {d}" for d in directives]
+        # extra_sbatch entries are whole directives from the host profile.
+        # Accepted with or without the prefix, because a profile that spells
+        # one out and one that does not must not produce different scripts.
+        for extra in self.host.extra_sbatch:
+            extra = extra.strip()
+            if not extra:
+                continue
+            lines.append(extra if extra.startswith(self._SBATCH)
+                         else f"{self._SBATCH} {extra}")
+
+        lines += ["", "set -e", ""]
 
         if self.host.modules:
             lines += [self.host.module_block(), ""]
@@ -605,9 +1041,64 @@ class Submitter:
                   "",
                   "date",
                   ""]
-        return "\n".join(lines)
 
-    def submit_array(self, run_dirs, walltime=None):
+        script = "\n".join(lines)
+        self._validate_batch_script(script)
+        return script
+
+    def _validate_batch_script(self, script):
+        """Refuse to hand sbatch something it would misread.
+
+        Every rule here is a failure mode that produces no error at
+        submission time, or produces one only after the sweep has already
+        written its run directories:
+
+        * a first line that is not `#!` -- sbatch rejects the file outright,
+          which is the loud one, and it is what indentation did on param;
+        * an indented `#SBATCH` -- ignored, so the job silently takes the
+          cluster default for whatever that directive set;
+        * a `#SBATCH` after the first executable line -- ignored for the same
+          reason and much harder to see, because the line looks correct;
+        * `--time` -- this project does not set walltimes (see array_script),
+          so one appearing here means something re-introduced a hand-kept
+          limit.
+
+        Raises. A script that is wrong in any of these ways is wrong for every
+        element of the array, and the array is the whole sweep.
+        """
+        lines = script.splitlines()
+        if not lines or not lines[0].startswith("#!"):
+            raise SystemExit(
+                f"🚨 _validate_batch_script: the generated script does not "
+                f"start with #!. sbatch refuses it with 'This does not look "
+                f"like a batch script'. First line was "
+                f"{(lines[0] if lines else '')!r}.")
+
+        seen_command = False
+        for n, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith(self._SBATCH):
+                if not line.startswith(self._SBATCH):
+                    raise SystemExit(
+                        f"🚨 _validate_batch_script: line {n} is an indented "
+                        f"#SBATCH directive, which sbatch ignores silently: "
+                        f"{line!r}")
+                if seen_command:
+                    raise SystemExit(
+                        f"🚨 _validate_batch_script: line {n} is a #SBATCH "
+                        f"directive after the script's first command, where "
+                        f"sbatch stops reading them: {line!r}")
+                if "--time" in stripped:
+                    raise SystemExit(
+                        f"🚨 _validate_batch_script: line {n} requests a "
+                        f"walltime: {line!r}. The queue's limit is the "
+                        f"cluster administrator's to set and this project "
+                        f"does not impose one -- see array_script().")
+            elif stripped and not stripped.startswith("#"):
+                seen_command = True
+        return script
+
+    def submit_array(self, run_dirs):
         """Submit a whole sweep as ONE array job, and return.
 
         Replaces both the login-node submission loop and the compute-node
@@ -626,71 +1117,144 @@ class Submitter:
         the throttling, and the whole sweep is one squeue line rather than N.
         """
         if not run_dirs:
-            print("nothing to submit.", flush=True)
+            # Not an error -- a sweep whose points are all archived prepares
+            # nothing, which is the normal outcome of re-running one. But the
+            # reason is worth saying, because "nothing to submit" and "the
+            # sweep failed" look identical in a scrollback otherwise.
+            print(f"nothing to submit: no point of this sweep needed "
+                  f"preparing.", flush=True)
             return None
 
+        self._require_run_root()
         limit = self.max_array_size()
         if limit is not None and len(run_dirs) > limit:
             raise SystemExit(
                 f"{len(run_dirs)} points exceeds this cluster's MaxArraySize "
                 f"of {limit}. Split the sweep, or raise it with the admins.")
 
-        (self.cwd / ARRAY_LOG_DIR).mkdir(exist_ok=True)
-        # The index -> directory map the array script reads. Line N+1 is the
-        # directory for SLURM_ARRAY_TASK_ID N.
-        (self.cwd / ARRAY_MAP).write_text(
-            "\n".join(d.name for d in run_dirs) + "\n")
+        # SLURM writes here before the script cds anywhere, so a failure that
+        # happens before the cd still leaves a trace. If it cannot be created
+        # the array has nowhere to report such a failure, so this is a stop.
+        log_dir = self.run_root / ARRAY_LOG_DIR
+        log_dir.mkdir(exist_ok=True)
+        if not log_dir.is_dir():
+            raise SystemExit(
+                f"🚨 {log_dir} is not a directory. SLURM writes every array "
+                f"element's pre-cd output there; without it a failure before "
+                f"the cd leaves nothing behind at all.")
 
-        script = self.cwd / f"sweep_{self.model}.sh"
-        script.write_text(self.array_script(len(run_dirs), walltime))
+        # The index -> directory map the array script reads. Line N+1 is the
+        # directory for SLURM_ARRAY_TASK_ID N. Written and then read back:
+        # every element resolves its own directory through this file, so a
+        # short or reordered map is 1..N wrong runs in the right directories,
+        # which nothing downstream would flag.
+        names = [d.name for d in run_dirs]
+        (self.run_root / ARRAY_MAP).write_text("\n".join(names) + "\n")
+        written = (self.run_root / ARRAY_MAP).read_text().split()
+        if written != names:
+            raise SystemExit(
+                f"🚨 {ARRAY_MAP} does not read back as it was written "
+                f"({len(written)} of {len(names)} entries match). Every array "
+                f"element resolves its run directory through that file. "
+                f"Nothing was submitted.")
+
+        script = self.run_root / f"sweep_{self.model}.sh"
+        script.write_text(self.array_script(len(run_dirs)))
 
         if self.dry_run:
             print(f"  [dry-run] would submit {len(run_dirs)} point(s) as an "
-                  f"array, {self.max_concurrent_jobs} at a time", flush=True)
+                  f"array, {self.max_concurrent_jobs} at a time\n"
+                  f"  [dry-run] script written: {script}", flush=True)
             return None
 
-        r = subprocess.run(["sbatch", script.name], cwd=self.cwd,
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run(["sbatch", script.name], cwd=self.run_root,
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            raise SystemExit(
+                f"🚨 no sbatch on this machine, so {script} was written but "
+                f"not submitted. Run the generator on a cluster login node, "
+                f"or with --dry-run.")
         if r.returncode != 0:
-            raise SystemExit(f"could not submit the array job:\n{r.stderr.strip()}")
+            raise SystemExit(f"🚨 could not submit the array job:\n"
+                             f"{r.stderr.strip()}\n   The script is at {script} "
+                             f"and the run directories are prepared; fix the "
+                             f"cause and sbatch it, or rerun the generator.")
 
-        print(r.stdout.strip(), flush=True)
         job_id = re.search(r"(\d+)", r.stdout)
-        job_id = job_id.group(1) if job_id else ""
+        if not job_id:
+            raise SystemExit(
+                f"🚨 sbatch reported success but named no job id: "
+                f"{r.stdout.strip()!r}. Without the id nothing can tell later "
+                f"whether this array is still running, so check `squeue -u "
+                f"{self.slurm_user}` by hand before submitting again.")
+        job_id = job_id.group(1)
         # preparing_run() needs this on a later invocation: an array element
         # reports the SUBMIT directory as its WorkDir, not its run directory,
         # so directories can no longer be matched to live jobs one by one.
-        (self.cwd / ARRAY_JOB_ID).write_text(job_id + "\n")
+        (self.run_root / ARRAY_JOB_ID).write_text(job_id + "\n")
 
-        print(f"{len(run_dirs)} point(s) queued as array {job_id}, "
-              f"{self.max_concurrent_jobs} running at a time.\n"
-              f"  squeue -u {self.slurm_user}\n"
-              f"  logs: {self.cwd}/{ARRAY_LOG_DIR}/ (pre-cd) and each "
-              f"dir_NNNNN/mpi_logs_*.out (the run itself)", flush=True)
+        self.note(f"array {job_id}: {len(run_dirs)} element(s), "
+                  f"{self.max_concurrent_jobs} at a time, "
+                  f"{self.cores_per_job()} cores each")
+        print(f"array {job_id}: {len(run_dirs)} point(s), "
+              f"{self.max_concurrent_jobs} at a time.  "
+              f"squeue -u {self.slurm_user}", flush=True)
         return job_id
+
+    def _discard(self, run_dir):
+        """Remove a directory this sweep created moments ago and could not
+        finish filling.
+
+        Only ever called on a dir_NNNNN that new_run_dir() made in this
+        process, before anything of value is in it -- that is what makes
+        removal the right move rather than quarantine. It used to be
+        rmtree(ignore_errors=True), which turned a failed removal into a
+        leftover directory that the NEXT invocation reads as a prepared run:
+        empty, in no directories.txt, and impossible to explain later.
+        """
+        try:
+            shutil.rmtree(run_dir)
+        except OSError as e:
+            raise SystemExit(
+                f"🚨 could not remove the half-prepared {run_dir} ({e}). It has "
+                f"no task.csv and no binary, so leaving it in place would put "
+                f"an empty run directory in the run root. Remove it by hand "
+                f"and rerun.")
 
     def _quarantine(self, run_dir, why, detail=""):
         """Move a failed run dir aside so it can be inspected, without letting
-        it look like a pending job to preparing_run()."""
-        backup = self.cwd / BACKUP_DIRNAME
+        it look like a pending job to preparing_run().
+
+        A failed MOVE used to fall through to deleting the directory. That is
+        backwards: quarantine exists so a failure can be looked at, and the
+        one case where the move fails is the one case where nobody gets to.
+        Now the directory stays where it is and the sweep stops -- a run root
+        that cannot be tidied is a fact about the filesystem, and the rest of
+        the sweep would be writing into the same one.
+        """
+        backup = self.run_root / BACKUP_DIRNAME
         backup.mkdir(exist_ok=True)
         target = backup / run_dir.name
         if target.exists():
             target = backup / f"{run_dir.name}_{int(time.time())}"
         try:
             shutil.move(str(run_dir), str(target))
-        except OSError:
-            shutil.rmtree(run_dir, ignore_errors=True)
-            target = None
-        print(f"  ⚠️  {why} for {run_dir.name}"
-              + (f"; moved to {target}" if target else "; removed"), flush=True)
+        except OSError as e:
+            raise SystemExit(
+                f"🚨 {why} for {run_dir.name}, and it could not be moved to "
+                f"{target} ({e}). It is still in the run root, where "
+                f"preparing_run() will read it as an unfinished run. Nothing "
+                f"else was prepared or submitted."
+                + (f"\n      {detail.strip()}" if detail else ""))
+        print(f"  ⚠️  {why} for {run_dir.name}; moved to {target}", flush=True)
         if detail:
             tail = "\n".join(detail.strip().splitlines()[-8:])
             print(f"      {tail}", flush=True)
 
     def _recorded_array_id(self):
         """The last array job id submitted from this directory, or None."""
-        path = self.cwd / ARRAY_JOB_ID
+        path = self.run_root / ARRAY_JOB_ID
         if not path.exists():
             return None
         return path.read_text().strip() or None
@@ -713,9 +1277,17 @@ class Submitter:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
         if out.returncode != 0:
-            # squeue exits nonzero for a job id it no longer knows about,
-            # which is the normal state once an array has drained.
-            return []
+            # squeue exits nonzero BOTH for a job id it no longer knows about
+            # -- the normal state once an array has drained -- and for a real
+            # failure to answer. Only the first means "nothing is running",
+            # and the difference matters: the caller's 'begin' branch DELETES
+            # every directory in directories.txt on the strength of it. So the
+            # message is read, and anything else is "unknown".
+            if "invalid job id" in (out.stderr or "").lower():
+                return []
+            print(f"⚠️  _array_still_live: squeue could not be asked about "
+                  f"array {job_id}: {(out.stderr or '').strip()}", flush=True)
+            return None
         return [line.split()[0] for line in out.stdout.splitlines() if line.strip()]
 
     def _quarantine_reason(self, name, why, detail=""):

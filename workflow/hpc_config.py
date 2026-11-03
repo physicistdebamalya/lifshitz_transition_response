@@ -30,6 +30,16 @@ def detect_host():
         return "param"
     return "local"
 
+# No per-host absolute-path table lives here on purpose. Every path the
+# workflow needs is derived from something the running process can already
+# see: the run root and the registry from the repository's own location
+# (submit_utils.repo_root(), which resolves from __file__), and the two remote
+# $HOMEs from HostConfig.remote_home below, which hpc_transfer_utils.base_path()
+# is the single reader of. A second table of "/iitgn/homedirs/... vs
+# /home/debamalya.dutta/..." would have to be kept in step with remote_home by
+# hand, and that is exactly the drift that left a stale -mtune in
+# workflow/Makefile.job (CLAUDE.md, "hpc runs before 2026-08-21").
+
 
 def cores_per_node_from_slurm(partition, timeout=10):
     """Cores/node read out of SLURM instead of a second hand-kept constant.
@@ -38,19 +48,40 @@ def cores_per_node_from_slurm(partition, timeout=10):
     is right even if the cluster's node mix changes under us. Only valid
     where a partition's nodes are homogeneous, which is true of small,
     medium and large here (verified: 40, 32 and 40 cores/node uniformly).
-    Returns None when SLURM is not reachable -- on a laptop, say -- and the
-    caller then keeps the profiled value. Adapted from
+    Returns None when there is no SLURM to ask -- on the workstation, say --
+    and the caller then keeps the profiled value. Adapted from
     Superconductivity's CompileConfig.autodetect_npn().
+
+    Not reachable and answering-unintelligibly are kept apart. The first is
+    the normal state off-cluster and is silent; the second means scontrol is
+    there and this function no longer understands it, which is a real
+    discrepancy and says so. Neither raises: this is a cross-check on a
+    measured table, and the table -- not this call -- is what sizes the job,
+    so a failure here must not stop a submission that is otherwise correct.
     """
     try:
         out = subprocess.run(["scontrol", "show", "partition", partition],
                              capture_output=True, text=True, check=True,
                              timeout=timeout).stdout
-        total_cpus = int(re.search(r"TotalCPUs=(\d+)", out).group(1))
-        total_nodes = int(re.search(r"TotalNodes=(\d+)", out).group(1))
-    except Exception:
+    except FileNotFoundError:
+        return None                      # no scontrol at all: not a cluster
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"⚠️  cores_per_node_from_slurm: scontrol is present but "
+              f"`scontrol show partition {partition}` failed ({type(e).__name__}). "
+              f"Keeping hpc_config's measured value for {partition!r} -- confirm "
+              f"it still matches the cluster before trusting the job size.",
+              flush=True)
         return None
-    return total_cpus // total_nodes if total_nodes else None
+
+    cpus = re.search(r"TotalCPUs=(\d+)", out)
+    nodes = re.search(r"TotalNodes=(\d+)", out)
+    if not cpus or not nodes or int(nodes.group(1)) == 0:
+        print(f"⚠️  cores_per_node_from_slurm: could not read TotalCPUs/"
+              f"TotalNodes out of `scontrol show partition {partition}`. The "
+              f"output format changed, or {partition!r} is not a queue here. "
+              f"Keeping hpc_config's measured value.", flush=True)
+        return None
+    return int(cpus.group(1)) // int(nodes.group(1))
 
 
 @dataclass
@@ -116,9 +147,16 @@ class PartitionProfile:
     cores_per_node: int
     numa_per_node: int      # NUMA domains per node -- sets the rank count
     cpu: str
-    walltime: str
     nodes_total: int
     cpu_cap: int            # QoS MaxTRESPU: cores this user may hold at once
+
+    # No walltime field, deliberately (2026-08-27). The queue's time limit is
+    # the cluster administrator's to set and SLURM's to apply: a job that
+    # requests none gets the queue default, and `scontrol show partition <q>`
+    # is the live authority on what that is. A copy kept here would be a
+    # second, hand-maintained answer to a question the scheduler already
+    # answers -- and the array script deliberately sends no --time, so it
+    # would not even be an answer anything acts on.
 
     @property
     def cores_per_numa(self):
@@ -143,17 +181,17 @@ HPC_PARTITIONS = {
     # 4 NUMA domains per node: sub-NUMA clustering is on here, unlike the
     # others, so this one wants 4 ranks x 10 threads rather than 2 x 20.
     "small": PartitionProfile("small", 40, 4, "Xeon Gold 6230 @ 2.10GHz",
-                              "3-00:00:00", 5, FATQOS_CPU_CAP),
+                              5, FATQOS_CPU_CAP),
     "medium": PartitionProfile("medium", 32, 2, "Xeon Gold 6130 @ 2.10GHz",
-                               "5-00:00:00", 11, FATQOS_CPU_CAP),
+                               11, FATQOS_CPU_CAP),
     "large": PartitionProfile("large", 40, 2, "Xeon Gold 6148 @ 2.40GHz",
-                              "10-00:00:00", 11, FATQOS_CPU_CAP),
+                              11, FATQOS_CPU_CAP),
     # cn17 alone, 2 x 16 like medium -- and IS medium's silicon: verified
     # 2026-08-21 via srun+lscpu, Xeon Gold 6130 @ 2.10GHz, no VNNI. Its 8-core
     # QoS cap makes it a smoke-test queue only: a whole node cannot be
     # claimed here.
     "test": PartitionProfile("test", 32, 2, "Xeon Gold 6130 @ 2.10GHz",
-                             "5:00:00", 1, 8),
+                             1, 8),
 }
 
 
@@ -179,16 +217,16 @@ PARAM_PARTITIONS = {
     # limit: it is meant for quick interactive checks shared by every user
     # on the cluster, not for occupying both of its nodes at once.
     "debug": PartitionProfile("debug", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
-                              "5:00:00", 2, 48),
+                              2, 48),
     "small": PartitionProfile("small", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
-                              "3-00:00:00", 18, PARAM_QOS_CPU_CAP),
+                              18, PARAM_QOS_CPU_CAP),
     "medium": PartitionProfile("medium", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
-                               "5-00:00:00", 40, PARAM_QOS_CPU_CAP),
+                               40, PARAM_QOS_CPU_CAP),
     "large": PartitionProfile("large", 48, 2, "Xeon Platinum 8268 @ 2.90GHz",
-                              "10-00:00:00", 50, PARAM_QOS_CPU_CAP),
+                              50, PARAM_QOS_CPU_CAP),
     "highmemory": PartitionProfile("highmemory", 48, 2,
                                    "Xeon Platinum 8268 @ 2.90GHz",
-                                   "10-00:00:00", 39, PARAM_QOS_CPU_CAP),
+                                   39, PARAM_QOS_CPU_CAP),
 }
 
 
@@ -343,9 +381,9 @@ HPC = HostConfig(
     # parameter point claims the full cap by itself (2026-08-23
     # resource-allocation policy -- see plan_partition()'s rule 3), so
     # max_concurrent_jobs is 1 and the array runs its points strictly one
-    # after another. large also gives the longest walltime of the three
-    # (10 days vs medium's 5), useful headroom now that a point runs to
-    # completion alone rather than sharing a queue slot.
+    # after another. Whatever time limit the queue carries is the admins' to
+    # set and SLURM's to apply -- the array script requests none -- so it is
+    # not part of this choice and is not recorded here.
     # Change queue and layout together with s.use_partition(...) in the
     # generator rather than editing npn/cpt here.
     partition="large",

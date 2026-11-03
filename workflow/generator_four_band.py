@@ -51,8 +51,9 @@ $HOME, or forced with  --host local|param|hpc .
 What each one controls
 ----------------------
 partition   #SBATCH --partition -- the SLURM queue every array element runs
-            in. It also selects the walltime (from the partition table) and,
-            through cpu_budget, how many elements run at once.
+            in, and through cpu_budget how many elements run at once. It does
+            NOT select a walltime: the job requests none, so the queue's own
+            limit applies -- the administrators' number, not one of ours.
 
 qos         #SBATCH --qos -- the quality-of-service class.
 
@@ -113,11 +114,16 @@ This is the coarsest split that avoids both extremes.
 
 The hpc queues, and why the layout differs per queue
 ---------------------------------------------------
-    queue    nodes  cores/node  NUMA  layout   CPU                 walltime
-    small      5        40       4    4 x 10   Xeon 6230 2.10GHz     3 d
-    medium    11        32       2    2 x 16   Xeon 6130 2.10GHz     5 d
-    large     11        40       2    2 x 20   Xeon 6148 2.40GHz    10 d
-    test       1        32       2    2 x  4   cn17 only             5 h
+    queue    nodes  cores/node  NUMA  layout   CPU
+    small      5        40       4    4 x 10   Xeon 6230 2.10GHz
+    medium    11        32       2    2 x 16   Xeon 6130 2.10GHz
+    large     11        40       2    2 x 20   Xeon 6148 2.40GHz
+    test       1        32       2    2 x  4   cn17 only
+
+No walltime column, on purpose: the queue's time limit belongs to the
+administrators and can be changed without telling us, so `scontrol show
+partition <queue>` is the only answer worth reading. Nothing here requests
+one.
 
 small runs with sub-NUMA clustering on -- 4 NUMA domains per node, not 2 --
 so its layout is 4 x 10 rather than large's 2 x 20, despite both having 40
@@ -126,16 +132,16 @@ why use_partition() exists.
 
 The param queues, and why gpu is out
 -------------------------------------
-    queue        nodes  cores/node  NUMA  layout   CPU                  walltime
-    debug          2        48       2    2 x 24   Xeon Platinum 8268     5 h
-    small         18        48       2    2 x 24   Xeon Platinum 8268     3 d
-    medium        40        48       2    2 x 24   Xeon Platinum 8268     5 d
-    large         50        48       2    2 x 24   Xeon Platinum 8268    10 d
-    highmemory    39        48       2    2 x 24   Xeon Platinum 8268    10 d
+    queue        nodes  cores/node  NUMA  layout   CPU
+    debug          2        48       2    2 x 24   Xeon Platinum 8268
+    small         18        48       2    2 x 24   Xeon Platinum 8268
+    medium        40        48       2    2 x 24   Xeon Platinum 8268
+    large         50        48       2    2 x 24   Xeon Platinum 8268
+    highmemory    39        48       2    2 x 24   Xeon Platinum 8268
 
 Every CPU queue here is the same layout -- 2 sockets, hyperthreading off, no
-sub-NUMA clustering -- so unlike hpc, moving between them changes walltime
-and queue-wait, never npn/cpt. The one queue genuinely left out is gpu (10
+sub-NUMA clustering -- so unlike hpc, moving between them changes the time
+limit and the queue-wait, never npn/cpt. The one queue genuinely left out is gpu (10
 nodes, Xeon Gold 6248, 2 x 20 -- the login nodes' own CPU model): it needs a
 --gres=gpu request that use_partition() has no field for, and this solver
 has no GPU code path, so hpc_config.PARAM_PARTITIONS omits it deliberately
@@ -208,7 +214,7 @@ How to change them
    slurm_user, and every array script written later reads the rest:
 
        s = Submitter("four_band", host=args.host, ...)
-       s.job_name = args.name         # the same pattern, already in main()
+       s.job_name = "fourband_rerun"  # normally the submission gate asks
        s.max_concurrent_jobs = 1      # be polite while the cluster is busy
 
    Only these seven are copied onto the Submitter. modules, env_exports,
@@ -266,34 +272,45 @@ workflow/, or with workflow/ on sys.path):
     >>> from submit_utils import Submitter
     >>> print(Submitter("four_band", host="param").array_script(count=23))
 
---dry-run is the other half of the check: it builds dir_NNNNN and writes
-task.csv into each, then stops before the binary is built, copied, or
-anything is submitted. It does not write array_map.txt or sweep_<model>.sh,
-so use array_script() above to inspect the #SBATCH block.
+--dry-run is the other half of the check: it builds dir_NNNNN, writes
+task.csv into each, and writes array_map.txt and sweep_<model>.sh -- then
+stops before the binary is built or copied and before anything is submitted,
+naming the script it wrote. So the #SBATCH block a real run would use can be
+read off disk, not just off array_script().
 
 What running this actually does
 ==============================
     python3 workflow/generator_<model>.py
 
-That is the whole command -- there is no `make` step to remember. In order:
+That is the whole command -- no `make` step, no `cd` first, and no
+--archive to pass. Run directories go to <repo>/four_band/ wherever it is
+invoked from (submit_utils.run_root_for), and the registry already_exists()
+reads is derived the same way. In order:
 
-  1. asks the resume/begin question if a previous sweep left incomplete
+  1. prints the plan and requires a typed `yes` plus a job name. Nothing has
+     touched disk at this point, so declining costs nothing;
+  2. asks the resume/begin question if a previous sweep left incomplete
      directories (login node, where there is a terminal to ask on);
-  2. builds the model binary ONCE, here, with module purge/load handled
+  3. builds the model binary ONCE, here, with module purge/load handled
      automatically. ensure_binary() REFUSES to do this inside a SLURM job;
-  3. writes one dir_NNNNN per point, each holding a one-row task.csv and a
+  4. writes one dir_NNNNN per point, each holding a one-row task.csv and a
      copy of the binary, skipping points the archive already has;
-  4. submits the whole sweep as ONE `sbatch --array=0-N%K` and exits.
+  5. submits the whole sweep as ONE `sbatch --array=0-N%K` and exits.
+
+The terminal gets the plan, the tally and anything that went wrong. The
+per-point skip/prepared lines go to <repo>/four_band/submission_log.txt, where
+they are still greppable and no longer scroll the sbatch result away.
 
 Nothing is left running. SLURM runs at most K elements at a time (K fills
 the QoS core cap -- see "The 240-core cap" above), so `squeue` shows one line
 for the sweep rather than N. With the default layout, K = 1: each point
 claims the entire per-user core budget and runs to completion before the
 next one starts, so a sweep of many points finishes them at maximum
-per-point speed but strictly serially. If a point cannot finish inside its
-queue's walltime (see the queue tables above) it is killed mid-run and does
-not resume automatically -- pick a longer-walltime queue with use_partition()
-before submitting, or trade some per-point throughput for more concurrency
+per-point speed but strictly serially. If a point cannot finish inside the
+queue's time limit (`scontrol show partition <queue>`) it is killed mid-run
+and does not resume automatically -- pick a queue that allows longer with
+use_partition() before submitting, or trade some per-point throughput for
+more concurrency
 (see "How to change them" above) if a sweep's total wall-clock time matters
 more than any single point's.
 
@@ -334,11 +351,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
 
 import numpy as np                                            # noqa: E402
 
-from data_utils import clean_path                             # noqa: E402
 from models import FOUR_BAND                                  # noqa: E402
-from submit_utils import Submitter, expand_sweep  # noqa: E402
+from submit_utils import (Submitter, confirm_and_job_name,     # noqa: E402
+                          default_archive, expand_sweep)
 
-ARCHIVE = clean_path("/home/debamalya/ComputationData/PostDoc/programming/new/data/four_band_model")
+# Where already_exists() reads the registry, derived from where this file is
+# and which machine it is on: ~/ComputationData/.../data/four_band_model on
+# the workstation, <repo>/archive/four_band_model on a cluster -- which is
+# exactly where hpc_transfers.py puts it on a push. --archive still overrides.
+# It used to be a workstation-only literal, so a cluster run needed --archive
+# spelled out or it silently treated all 23 points as new -- 23 points whose
+# results are already on disk.
+ARCHIVE = default_archive("four_band")
+
+# ══════════════════════════════════════════════════════════════════════════
+# Submission knobs
+# ══════════════════════════════════════════════════════════════════════════
+
+# Whether a parameter point that the archive already holds is skipped.
+#
+#   True   consult ARCHIVE and skip every point already computed. The normal
+#          setting: a sweep can be re-run after adding values to it and only
+#          the genuinely new points cost anything.
+#   False  ignore the archive entirely and submit every point in the sweep.
+#
+# False does NOT overwrite anything. Run IDs are random 5-digit numbers, so a
+# recomputed point lands beside the existing one as a second run with the same
+# parameters, and the subset matcher then finds two entries for one query --
+# which is exactly what you want here if you are recomputing the 29 four_band
+# runs whose Jx is quantized (CLAUDE.md, "Known data issues"), and exactly
+# what you do not want by accident.
+#
+# The confirmation gate prints which of the two is in force before asking.
+SKIP_EXISTING = True
 
 # ── the (E_F, nu) pairs the Lifshitz scan walks along ─────────────────────────
 # nu is locked to ef rather than swept independently: the probe frequency has
@@ -424,14 +469,17 @@ def main():
                          "binary is built or copied and nothing is submitted")
     ap.add_argument("--host", default=None, help="local | param | hpc "
                                                  "(default: autodetect from $HOME)")
-    ap.add_argument("--name", default="fourband")
+    ap.add_argument("--name", default=None,
+                    help="SLURM job name for the array, answering the gate's "
+                         "second question non-interactively. It does NOT "
+                         "answer the first: yes still has to be typed. "
+                         f"(default 'fourband')")
     ap.add_argument("--archive", default=ARCHIVE,
                     help="logfile.txt to check for already-computed points")
     args = ap.parse_args()
 
     s = Submitter("four_band", host=args.host, data_path=args.archive,
                   dry_run=args.dry_run)
-    s.job_name = args.name
 
     # ── Per-sweep overrides ───────────────────────────────────────────────
     # On hpc one call picks the queue AND the layout that fits it. It sets
@@ -451,6 +499,31 @@ def main():
     print(s.resource_summary(), flush=True)
     print(f"model=four_band  points={len(points)}", flush=True)
 
+    # The gate, before the lock, the build and the first directory -- so that
+    # declining leaves the run root exactly as it was found. A dry run submits
+    # nothing and so has nothing to confirm and no array to name.
+    existing = ("skip points already in the archive" if SKIP_EXISTING else
+                "RECOMPUTE every point, ignoring the archive")
+    summary = ("  model      : four_band",
+               f"  host       : {s.host.name}",
+               f"  points     : {len(points)}",
+               f"  existing   : {existing}",
+               f"  archive    : {s.data_path}",
+               f"  run dirs in: {s.run_root}")
+
+    if args.dry_run:
+        s.job_name = args.name or "fourband"
+        for line in summary:
+            print(line, flush=True)
+        print("--dry-run: nothing is submitted, so nothing is confirmed.",
+              flush=True)
+    else:
+        s.job_name = confirm_and_job_name("fourband", summary=summary,
+                                          name=args.name)
+
+    # After the gate, never before: this is the first thing that touches disk.
+    s.ensure_run_root()
+
     if not args.dry_run:
         s.acquire_lock()
         s.preparing_run()
@@ -460,23 +533,38 @@ def main():
         # this work on param at all.
         s.ensure_binary()
 
+    # Per-point lines go to the submission log, not the terminal: 207 of them
+    # scrolled away the two lines worth acting on, and every one of them is
+    # also in directories.txt and in the point's own task.csv. A FAILED point
+    # is the exception and is printed as well -- it is the one line nobody
+    # should have to go looking for.
+    s.open_submission_log((*summary, f"  job name   : {s.job_name}",
+                           f"  dry run    : {args.dry_run}"))
+
     prepared, skipped, failed = [], 0, 0
     for p in points:
-        if s.already_exists(p):
-            print(f"  skip ef={p['ef']:<5} nu={p['nuX']:<9}", flush=True)
+        label = f"ef={p['ef']:<5} nu={p['nuX']:<9}"
+        if SKIP_EXISTING and s.already_exists(p):
+            s.note(f"  skip      {label}")
             skipped += 1
             continue
 
         run_dir = s.prepare(p)
         if run_dir is None:
+            s.note(f"  FAILED    {label}")
+            print(f"  ⚠️  could not prepare {label}", flush=True)
             failed += 1
             continue
         prepared.append(run_dir)
-        print(f"  prepared ef={p['ef']:<5} nu={p['nuX']:<9}"
-              f" -> {run_dir.name}", flush=True)
+        s.note(f"  prepared  {label} -> {run_dir.name}")
 
-    print(f"\n{len(prepared)} prepared, {skipped} already present"
-          + (f", {failed} failed" if failed else "") + ".", flush=True)
+    tally = (f"{len(points)} point(s): {len(prepared)} prepared, "
+             f"{skipped} already present"
+             + ("" if SKIP_EXISTING else
+                " (archive not consulted: SKIP_EXISTING is False)")
+             + (f", {failed} FAILED" if failed else "") + ".")
+    s.note(tally)
+    print(f"\n{tally}\n  per-point detail: {s.submission_log}", flush=True)
 
     # One sbatch for the whole sweep, then this process exits. SLURM runs at
     # most max_concurrent_jobs elements at a time, so nothing has to stay
